@@ -1,16 +1,21 @@
 import io
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
 import wave
+from pathlib import Path
 
 import numpy as np
-
 from omni_tokenizer.audio import (
-    AudioCancelled, AudioError, SincResampler, iter_audio_segments,
-    iter_decoded_chunks, log_mel, mel_filters, segment_pcm,
+    AudioCancelled,
+    AudioError,
+    SincResampler,
+    iter_audio_segments,
+    iter_decoded_chunks,
+    log_mel,
+    mel_filters,
+    segment_pcm,
 )
 
 
@@ -31,11 +36,18 @@ class AudioTests(unittest.TestCase):
     def test_first_channel_and_integer_pcm(self):
         stereo = np.array([[-32768, 2000], [0, 3000], [32767, 4000]], dtype="<i2")
         decoded = list(iter_decoded_chunks(wav_bytes(stereo), block_frames=2))
-        np.testing.assert_array_equal(np.concatenate([x for x, _ in decoded]), stereo[:, 0].astype(np.float32) / 32768)
+        np.testing.assert_array_equal(
+            np.concatenate([x for x, _ in decoded]),
+            stereo[:, 0].astype(np.float32) / 32768,
+        )
         self.assertEqual([rate for _, rate in decoded], [16000, 16000])
         for width, data, expected in (
             (1, np.array([0, 128, 255], np.uint8), [-1, 0, 127 / 128]),
-            (3, np.array([0, 0, 128, 0, 0, 0, 255, 255, 127], np.uint8), [-1, 0, 8388607 / 8388608]),
+            (
+                3,
+                np.array([0, 0, 128, 0, 0, 0, 255, 255, 127], np.uint8),
+                [-1, 0, 8388607 / 8388608],
+            ),
             (4, np.array([-2147483648, 0, 1073741824], "<i4"), [-1, 0, 0.5]),
         ):
             chunks = list(iter_decoded_chunks(wav_bytes(data, width=width)))
@@ -84,20 +96,33 @@ class AudioTests(unittest.TestCase):
         self.assertLess(float(np.std(high_output)), 0.001)
 
     def test_exact_segment_boundaries_and_offsets(self):
-        for length, expected in ((1, [1]), (479999, [479999]), (480000, [480000]), (480001, [480000, 1]), (960000, [480000, 480000])):
+        for length, expected in (
+            (1, [1]),
+            (479999, [479999]),
+            (480000, [480000]),
+            (480001, [480000, 1]),
+            (960000, [480000, 480000]),
+        ):
             samples = np.zeros(length, np.float32)
             chunks = (samples[begin : begin + 1023] for begin in range(0, length, 1023))
             segments = list(segment_pcm(chunks, 16000))
             self.assertEqual([item.valid_samples for item in segments], expected)
-            self.assertEqual([item.start_sample for item in segments], [i * 480000 for i in range(len(expected))])
-            self.assertEqual([item.index for item in segments], list(range(len(expected))))
+            self.assertEqual(
+                [item.start_sample for item in segments],
+                [i * 480000 for i in range(len(expected))],
+            )
+            self.assertEqual(
+                [item.index for item in segments], list(range(len(expected)))
+            )
 
     def test_pull_backpressure_and_cancellation(self):
         reads = []
+
         def chunks():
             for index in range(100):
                 reads.append(index)
                 yield np.zeros(16000, np.float32)
+
         generator = segment_pcm(chunks(), 16000)
         self.assertEqual(next(generator).valid_samples, 480000)
         self.assertEqual(len(reads), 30)
@@ -107,7 +132,15 @@ class AudioTests(unittest.TestCase):
             list(segment_pcm([np.zeros(1, np.float32)], 16000, cancel=lambda: True))
 
     def test_padding_and_validity_counts(self):
-        for length, valid_frames, codes in ((1, 1, 1), (159, 1, 1), (160, 1, 1), (1279, 8, 1), (1280, 8, 1), (1281, 9, 2), (480000, 3000, 375)):
+        for length, valid_frames, codes in (
+            (1, 1, 1),
+            (159, 1, 1),
+            (160, 1, 1),
+            (1279, 8, 1),
+            (1280, 8, 1),
+            (1281, 9, 2),
+            (480000, 3000, 375),
+        ):
             features = log_mel(np.zeros(length, np.float32))
             self.assertEqual(features.valid_frames, valid_frames)
             self.assertEqual(features.code_count, codes)
@@ -131,23 +164,46 @@ class AudioTests(unittest.TestCase):
         with self.assertRaises(AudioError):
             log_mel(np.zeros(480001, np.float32))
 
-    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is optional")
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is optional"
+    )
     def test_ffmpeg_preserves_rate_and_first_channel(self):
         values = np.arange(4401, dtype=np.int32)
-        stereo = np.column_stack(((values % 1000 - 500) * 30, np.full(4401, 30000))).astype("<i2")
+        stereo = np.column_stack(
+            ((values % 1000 - 500) * 30, np.full(4401, 30000))
+        ).astype("<i2")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.wav"
             compressed = Path(directory) / "compressed.flac"
             source.write_bytes(wav_bytes(stereo, rate=44100).getvalue())
-            subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-nostdin", "-i", str(source), str(compressed)],
-                           check=True, capture_output=True, timeout=30)
+            subprocess.run(
+                [
+                    shutil.which("ffmpeg"),
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-i",
+                    str(source),
+                    str(compressed),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
             chunks = list(iter_decoded_chunks(compressed, block_frames=317))
             self.assertTrue(all(rate == 44100 for _, rate in chunks))
-            np.testing.assert_array_equal(np.concatenate([chunk for chunk, _ in chunks]), stereo[:, 0].astype(np.float32) / 32768)
+            np.testing.assert_array_equal(
+                np.concatenate([chunk for chunk, _ in chunks]),
+                stereo[:, 0].astype(np.float32) / 32768,
+            )
             short_blocks = list(iter_audio_segments(compressed, block_frames=37))
             long_blocks = list(iter_audio_segments(compressed, block_frames=4096))
-            np.testing.assert_array_equal(short_blocks[0].samples, long_blocks[0].samples)
-            self.assertEqual(short_blocks[0].valid_samples, (4401 * 16000 + 44099) // 44100)
+            np.testing.assert_array_equal(
+                short_blocks[0].samples, long_blocks[0].samples
+            )
+            self.assertEqual(
+                short_blocks[0].valid_samples, (4401 * 16000 + 44099) // 44100
+            )
 
 
 if __name__ == "__main__":

@@ -9,22 +9,21 @@ on the longest waveform in a batch. It is not bit-exact to its CUDA STFT.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
 import json
 import math
 import os
-from pathlib import Path
 import queue
 import shutil
 import subprocess
 import tempfile
 import threading
-from typing import BinaryIO, Callable, Iterable, Iterator
 import wave
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 import numpy as np
-
 
 SAMPLE_RATE = 16000
 SEGMENT_SAMPLES = 480000
@@ -130,10 +129,16 @@ class SincResampler:
             indices = centers[:, None] + self._taps[None, :]
             valid = (indices >= 0) & (indices < self._total)
             relative = np.clip(indices - self._offset, 0, max(0, self._buffer.size - 1))
-            values = self._buffer[relative] if self._buffer.size else np.zeros_like(relative, dtype=np.float32)
+            values = (
+                self._buffer[relative]
+                if self._buffer.size
+                else np.zeros_like(relative, dtype=np.float32)
+            )
             values = np.where(valid, values, np.float32(0))
             count = end - self._next
-            output[written : written + count] = np.sum(values * self._weights[phases], axis=1, dtype=np.float32)
+            output[written : written + count] = np.sum(
+                values * self._weights[phases], axis=1, dtype=np.float32
+            )
             self._next = end
             written += count
         keep_from = max(0, self._next * self._source // self._target - self._radius)
@@ -158,7 +163,11 @@ def _pcm_first_channel(raw: bytes, sample_width: int, channels: int) -> np.ndarr
     if sample_width == 2:
         return np.frombuffer(raw, "<i2")[::channels].astype(np.float32) / 32768
     if sample_width == 3:
-        data = np.frombuffer(raw, np.uint8).reshape(-1, channels, 3)[:, 0, :].astype(np.int32)
+        data = (
+            np.frombuffer(raw, np.uint8)
+            .reshape(-1, channels, 3)[:, 0, :]
+            .astype(np.int32)
+        )
         signed = data[:, 0] | (data[:, 1] << 8) | (data[:, 2] << 16)
         signed = (signed ^ 0x800000) - 0x800000
         return signed.astype(np.float32) / 8388608
@@ -167,14 +176,32 @@ def _pcm_first_channel(raw: bytes, sample_width: int, channels: int) -> np.ndarr
     raise AudioError("WAV PCM must use 8, 16, 24, or 32 bits per sample")
 
 
-def _iter_ffmpeg(path: Path, block_frames: int, cancel: CancelCheck) -> Iterator[tuple[np.ndarray, int]]:
+def _iter_ffmpeg(
+    path: Path, block_frames: int, cancel: CancelCheck
+) -> Iterator[tuple[np.ndarray, int]]:
     executable, probe = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if executable is None or probe is None:
-        raise AudioError("This audio format requires ffmpeg and ffprobe on PATH; PCM WAV works without them")
+        raise AudioError(
+            "This audio format requires ffmpeg and ffprobe on PATH; PCM WAV works without them"
+        )
     try:
         result = subprocess.run(
-            [probe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate", "-of", "json", str(path)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=False,
+            [
+                probe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise AudioError("Audio probing exceeded its 30-second limit") from exc
@@ -187,9 +214,26 @@ def _iter_ffmpeg(path: Path, block_frames: int, cancel: CancelCheck) -> Iterator
     # Keep the original rate: the same continuous resampler handles every codec.
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(
-            [executable, "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0", "-vn",
-             "-af", "pan=mono|c0=c0", "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"],
-            stdout=subprocess.PIPE, stderr=errors,
+            [
+                executable,
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-af",
+                "pan=mono|c0=c0",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=errors,
         )
         pending = queue.Queue(maxsize=2)
         stopped = threading.Event()
@@ -246,7 +290,10 @@ def _iter_ffmpeg(path: Path, block_frames: int, cancel: CancelCheck) -> Iterator
 
 
 def iter_decoded_chunks(
-    source: str | os.PathLike[str] | BinaryIO, *, block_frames: int = 65536, cancel: CancelCheck = None,
+    source: str | os.PathLike[str] | BinaryIO,
+    *,
+    block_frames: int = 65536,
+    cancel: CancelCheck = None,
 ) -> Iterator[tuple[np.ndarray, int]]:
     """Read bounded first-channel PCM chunks; optional FFmpeg handles other files.
 
@@ -264,11 +311,17 @@ def iter_decoded_chunks(
         reader = wave.open(str(path) if path is not None else source, "rb")
     except (wave.Error, EOFError) as exc:
         if path is None:
-            raise AudioError("Binary streams must contain a supported PCM WAV file") from exc
+            raise AudioError(
+                "Binary streams must contain a supported PCM WAV file"
+            ) from exc
         yield from _iter_ffmpeg(path, block_frames, cancel)
         return
     with reader:
-        channels, width, rate = reader.getnchannels(), reader.getsampwidth(), reader.getframerate()
+        channels, width, rate = (
+            reader.getnchannels(),
+            reader.getsampwidth(),
+            reader.getframerate(),
+        )
         if not 1 <= channels <= 256 or not 1 <= rate <= 384000:
             raise AudioError("Unsupported WAV channel count or sample rate")
         remaining = int(reader.getnframes())
@@ -283,7 +336,10 @@ def iter_decoded_chunks(
 
 
 def segment_pcm(
-    chunks: Iterable[np.ndarray], source_rate: int, *, cancel: CancelCheck = None,
+    chunks: Iterable[np.ndarray],
+    source_rate: int,
+    *,
+    cancel: CancelCheck = None,
 ) -> Iterator[AudioSegment]:
     """Continuously resample and emit 30-second windows with one bounded buffer.
 
@@ -317,17 +373,24 @@ def segment_pcm(
             filled += take
             begin += take
             if filled == SEGMENT_SAMPLES:
-                yield AudioSegment(index, index * SEGMENT_SAMPLES, filled, buffer.copy())
+                yield AudioSegment(
+                    index, index * SEGMENT_SAMPLES, filled, buffer.copy()
+                )
                 index += 1
                 filled = 0
     if filled:
-        yield AudioSegment(index, index * SEGMENT_SAMPLES, filled, buffer[:filled].copy())
+        yield AudioSegment(
+            index, index * SEGMENT_SAMPLES, filled, buffer[:filled].copy()
+        )
     elif index == 0:
         raise AudioError("Audio input is empty")
 
 
 def iter_audio_segments(
-    source: str | os.PathLike[str] | BinaryIO, *, block_frames: int = 65536, cancel: CancelCheck = None,
+    source: str | os.PathLike[str] | BinaryIO,
+    *,
+    block_frames: int = 65536,
+    cancel: CancelCheck = None,
 ) -> Iterator[AudioSegment]:
     decoded = iter_decoded_chunks(source, block_frames=block_frames, cancel=cancel)
     try:
@@ -355,11 +418,16 @@ def mel_filters() -> np.ndarray:
     mel = np.linspace(0.0, max_mel, 130)
     frequencies = mel * (200.0 / 3)
     logarithmic = mel >= 15.0
-    frequencies[logarithmic] = 1000.0 * np.exp((mel[logarithmic] - 15.0) * (np.log(6.4) / 27.0))
+    frequencies[logarithmic] = 1000.0 * np.exp(
+        (mel[logarithmic] - 15.0) * (np.log(6.4) / 27.0)
+    )
     bins = np.linspace(0.0, 8000.0, 201)
     slopes = frequencies[None, :] - bins[:, None]
     differences = np.diff(frequencies)
-    filters = np.maximum(0.0, np.minimum(-slopes[:, :-2] / differences[:-1], slopes[:, 2:] / differences[1:]))
+    filters = np.maximum(
+        0.0,
+        np.minimum(-slopes[:, :-2] / differences[:-1], slopes[:, 2:] / differences[1:]),
+    )
     filters *= 2.0 / (frequencies[2:] - frequencies[:-2])
     filters.setflags(write=False)
     return filters
@@ -393,20 +461,28 @@ def log_mel(samples: np.ndarray) -> AudioFeatures:
     spectrum = np.empty((frames, 201), dtype=np.complex64)
     windows = np.lib.stride_tricks.sliding_window_view(waveform, 400)[::160][:frames]
     for begin in range(0, frames, 256):
-        spectrum[begin : begin + 256] = np.fft.rfft(windows[begin : begin + 256] * _hann(), axis=-1)
+        spectrum[begin : begin + 256] = np.fft.rfft(
+            windows[begin : begin + 256] * _hann(), axis=-1
+        )
     power = np.abs(spectrum, dtype=np.float64) ** 2
     features = np.log10(np.maximum(1e-10, mel_filters().T @ power.T)).astype(np.float32)
     np.maximum(features, features.max() - np.float32(8.0), out=features)
     features += np.float32(4.0)
     features *= np.float32(0.25)
     return AudioFeatures(
-        np.ascontiguousarray(features), valid, padded, (valid + 159) // 160,
+        np.ascontiguousarray(features),
+        valid,
+        padded,
+        (valid + 159) // 160,
         (valid + SAMPLE_MULTIPLE - 1) // SAMPLE_MULTIPLE,
     )
 
 
 def iter_feature_segments(
-    source: str | os.PathLike[str] | BinaryIO, *, block_frames: int = 65536, cancel: CancelCheck = None,
+    source: str | os.PathLike[str] | BinaryIO,
+    *,
+    block_frames: int = 65536,
+    cancel: CancelCheck = None,
 ) -> Iterator[tuple[AudioSegment, AudioFeatures]]:
     segments = iter_audio_segments(source, block_frames=block_frames, cancel=cancel)
     try:

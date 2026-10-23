@@ -2,9 +2,8 @@ import io
 import unittest
 
 import numpy as np
-from PIL import Image
-
 from omni_tokenizer.image import prepare_image, target_size
+from PIL import Image
 
 
 class ImagePreprocessingTests(unittest.TestCase):

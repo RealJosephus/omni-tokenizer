@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.24)
+project(omni_consumer LANGUAGES CXX)
+find_package(omni 0.1 CONFIG REQUIRED)
+add_executable(omni_consumer ../native_smoke.cpp)
+target_link_libraries(omni_consumer PRIVATE omni::omni)

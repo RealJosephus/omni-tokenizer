@@ -1,8 +1,8 @@
 import json
-from pathlib import Path
 import struct
 import tempfile
 import unittest
+from pathlib import Path
 
 from tools.convert import HEADER, check_package, inspect_model
 from tools.make_fixture import generate
@@ -27,6 +27,15 @@ class ModelPackageTests(unittest.TestCase):
     def test_data_corruption_is_detected(self):
         path = self.root / "image" / "model.otm"
         data = bytearray(path.read_bytes())
+        data[-1] ^= 1
+        path.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, "SHA256"):
+            check_package(path)
+
+    def test_explicit_model_filename_is_checked(self):
+        directory = self.root / "image"
+        path = directory / "renamed.otm"
+        data = bytearray((directory / "model.otm").read_bytes())
         data[-1] ^= 1
         path.write_bytes(data)
         with self.assertRaisesRegex(ValueError, "SHA256"):

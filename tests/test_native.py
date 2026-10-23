@@ -1,13 +1,12 @@
 import ctypes as C
 import os
-from pathlib import Path
 import shutil
 import struct
 
 import numpy as np
 import pytest
-
 from omni_tokenizer.native import Library, Model, NativeError
+
 from tools.convert import HEADER
 from tools.make_fixture import generate
 
@@ -35,10 +34,17 @@ def test_complete_audio_graph_and_valid_key_mask(library, models):
             assert model.info.layers == 2 and model.info.width == 4
             codes = context.encode_audio(expected["mel"], int(expected["valid_frames"]))
             np.testing.assert_array_equal(codes, expected["codes"])
-            np.testing.assert_allclose(context.features(len(codes)), expected["features"], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(
+                context.features(len(codes)), expected["features"], rtol=1e-5, atol=1e-6
+            )
             full = context.encode_audio(expected["mel"], expected["mel"].shape[1])
             np.testing.assert_array_equal(full, expected["full_codes"])
-            np.testing.assert_allclose(context.features(len(full)), expected["full_features"], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(
+                context.features(len(full)),
+                expected["full_features"],
+                rtol=1e-5,
+                atol=1e-6,
+            )
             assert context.peak_workspace_bytes > 0
 
 
@@ -47,9 +53,13 @@ def test_complete_image_graph_and_bfloat16_distance(library, models):
         with Model(library, models / "image") as model, model.context() as context:
             codes = context.encode_image(expected["pixels"])
             np.testing.assert_array_equal(codes, expected["codes"])
-            np.testing.assert_allclose(context.features(len(codes)), expected["features"], rtol=0, atol=1 / 128)
+            np.testing.assert_allclose(
+                context.features(len(codes)), expected["features"], rtol=0, atol=1 / 128
+            )
             for _ in range(3):
-                np.testing.assert_array_equal(context.encode_image(expected["pixels"]), codes)
+                np.testing.assert_array_equal(
+                    context.encode_image(expected["pixels"]), codes
+                )
 
 
 def test_unicode_model_path(library, models, tmp_path):
@@ -66,7 +76,9 @@ def test_contexts_retain_weights_after_model_handle_is_freed(library, models):
         model.close()
         try:
             for context in (first, second, first):
-                np.testing.assert_array_equal(context.encode_audio(expected["mel"], 9), expected["codes"])
+                np.testing.assert_array_equal(
+                    context.encode_audio(expected["mel"], 9), expected["codes"]
+                )
             with pytest.raises(RuntimeError, match="closed"):
                 model.context()
         finally:
@@ -83,7 +95,9 @@ def test_cancel_is_sticky_until_reset(library, models):
                     context.encode_audio(expected["mel"], 9)
                 assert failure.value.status == 6
             library.lib.omni_context_reset_cancel(context.handle)
-            np.testing.assert_array_equal(context.encode_audio(expected["mel"], 9), expected["codes"])
+            np.testing.assert_array_equal(
+                context.encode_audio(expected["mel"], 9), expected["codes"]
+            )
 
 
 def test_invalid_audio_frame_count_and_nonfinite_values(library, models):
@@ -104,14 +118,21 @@ def test_output_capacity_is_reported(library, models):
             output = np.empty(1, np.uint16)
             count = C.c_size_t()
             status = library.lib.omni_encode_audio(
-                context.handle, mel.ctypes.data_as(C.POINTER(C.c_float)), 16, 9,
-                output.ctypes.data_as(C.POINTER(C.c_uint16)), 1, C.byref(count),
+                context.handle,
+                mel.ctypes.data_as(C.POINTER(C.c_float)),
+                16,
+                9,
+                output.ctypes.data_as(C.POINTER(C.c_uint16)),
+                1,
+                C.byref(count),
             )
             assert status == 1
             assert count.value == 2
 
 
-@pytest.mark.parametrize("mutation", ["truncated", "config", "dtype", "overlap", "name", "shape"])
+@pytest.mark.parametrize(
+    "mutation", ["truncated", "config", "dtype", "overlap", "name", "shape"]
+)
 def test_invalid_models_fail_before_execution(library, models, tmp_path, mutation):
     data = bytearray((models / "audio" / "model.otm").read_bytes())
     if mutation == "truncated":

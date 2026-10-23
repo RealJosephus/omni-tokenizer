@@ -18,13 +18,18 @@ extern "C" {
 
 typedef struct omni_model omni_model;
 typedef struct omni_context omni_context;
-typedef void (*omni_trace_callback)(void *user, const char *stage, const float *values,
-                                    size_t rows, size_t columns);
+typedef void (*omni_trace_callback)(void *user, const char *stage, const float *values, size_t rows,
+                                    size_t columns);
 
 enum omni_status {
-    OMNI_OK = 0, OMNI_INVALID_ARGUMENT = 1, OMNI_IO_ERROR = 2,
-    OMNI_INVALID_MODEL = 3, OMNI_UNSUPPORTED = 4, OMNI_OUT_OF_MEMORY = 5,
-    OMNI_CANCELLED = 6, OMNI_INTERNAL_ERROR = 7
+    OMNI_OK = 0,
+    OMNI_INVALID_ARGUMENT = 1,
+    OMNI_IO_ERROR = 2,
+    OMNI_INVALID_MODEL = 3,
+    OMNI_UNSUPPORTED = 4,
+    OMNI_OUT_OF_MEMORY = 5,
+    OMNI_CANCELLED = 6,
+    OMNI_INTERNAL_ERROR = 7
 };
 enum omni_backend { OMNI_CPU = 0, OMNI_CUDA = 1 };
 enum omni_kind { OMNI_AUDIO = 1, OMNI_IMAGE = 2 };
@@ -56,24 +61,25 @@ OMNI_API void omni_context_cancel(omni_context *context);
 OMNI_API void omni_context_reset_cancel(omni_context *context);
 /* Optional synchronous diagnostics. Values are borrowed for the callback duration.
  * The callback must not throw or invoke inference on this context. */
-OMNI_API int omni_context_set_trace(omni_context *context, omni_trace_callback callback, void *user);
+OMNI_API int omni_context_set_trace(omni_context *context, omni_trace_callback callback,
+                                    void *user);
 /* mel is contiguous [mel_channels,frames], frames must be a multiple of 8.
  * valid_frames is ceil(valid_samples / 160), and codes_needed=ceil(valid_frames/8).
  * Canonical preprocessing pads each waveform to a multiple of 1280 samples.
  * Output is caller-owned; count is set on success, or to required capacity. */
-OMNI_API int omni_encode_audio(omni_context *context, const float *mel,
-                              uint32_t frames, uint32_t valid_frames,
-                              uint16_t *codes, size_t capacity, size_t *count);
+OMNI_API int omni_encode_audio(omni_context *context, const float *mel, uint32_t frames,
+                               uint32_t valid_frames, uint16_t *codes, size_t capacity,
+                               size_t *count);
 /* pixels is contiguous RGB CHW, preprocessed to [-1,1]. H/W are patch multiples.
  * The code grid has (height/patch_size,width/patch_size), in row-major order. */
-OMNI_API int omni_encode_image(omni_context *context, const float *pixels,
-                              uint32_t height, uint32_t width,
-                              uint16_t *codes, size_t capacity, size_t *count);
+OMNI_API int omni_encode_image(omni_context *context, const float *pixels, uint32_t height,
+                               uint32_t width, uint16_t *codes, size_t capacity, size_t *count);
 /* Copy the last pre-VQ features as float32 [code_count,code_dim].
  * Image features have been L2 normalized. Used for numerical validation. */
-OMNI_API int omni_context_copy_features(omni_context *context, float *output,
-                                       size_t capacity, size_t *count);
-/* Peak live activation/workspace allocation within this context, excluding weights. */
+OMNI_API int omni_context_copy_features(omni_context *context, float *output, size_t capacity,
+                                        size_t *count);
+/* Peak physical activation/workspace allocation, including cached buffers.
+ * Excludes model weights and CUDA library/driver allocations. */
 OMNI_API uint64_t omni_context_peak_workspace(const omni_context *context);
 
 #ifdef __cplusplus

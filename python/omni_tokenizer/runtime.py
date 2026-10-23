@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import json
-from pathlib import Path
 import threading
+from contextlib import contextmanager
 
 from .native import Library, Model, NativeError
 
@@ -51,7 +50,15 @@ class Tokenizer:
     limits belong to the server. Use separate instances for separate GPUs.
     """
 
-    def __init__(self, *, audio_model=None, image_model=None, device="cpu", library=None, max_codes=2_000_000):
+    def __init__(
+        self,
+        *,
+        audio_model=None,
+        image_model=None,
+        device="cpu",
+        library=None,
+        max_codes=2_000_000,
+    ):
         self.paths = {"audio": audio_model, "image": image_model}
         self.device = device
         self.library_path = library
@@ -80,16 +87,24 @@ class Tokenizer:
         if kind not in self.models:
             path = self.paths[kind]
             if not path:
-                raise TokenizationError("model_unavailable", f"No {kind} model configured")
+                raise TokenizationError(
+                    "model_unavailable", f"No {kind} model configured"
+                )
             if self.library is None:
                 self.library = Library(self.library_path)
             model = Model(self.library, path, self.device)
             if model.info.kind != {"audio": 1, "image": 2}[kind]:
                 model.close()
-                raise TokenizationError("invalid_model", f"Configured {kind} model has the wrong kind")
+                raise TokenizationError(
+                    "invalid_model", f"Configured {kind} model has the wrong kind"
+                )
             manifest = model.path.parent / "manifest.json"
             try:
-                data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+                data = (
+                    json.loads(manifest.read_text(encoding="utf-8"))
+                    if manifest.is_file()
+                    else {}
+                )
                 if not isinstance(data, dict):
                     raise ValueError("Model manifest must be a JSON object")
             except BaseException:
@@ -107,12 +122,15 @@ class Tokenizer:
                 "model_sha256": data.get("model_sha256", data.get("sha256")),
                 "profile": "audio-fp32-v1" if kind == "audio" else "image-bf16-v1",
                 "backend": self.device,
-                "preprocessing": "audio-canonical-v1" if kind == "audio" else "image-pillow-v1",
+                "preprocessing": "audio-canonical-v1"
+                if kind == "audio"
+                else "image-pillow-v1",
             }
         return self.models[kind]
 
     def encode_image(self, source, *, cancel=None):
         from .image import prepare_image
+
         cancel = cancel or Cancellation()
         cancel.check()
         prepared = prepare_image(source)
@@ -123,10 +141,19 @@ class Tokenizer:
             with cancel.bind(context):
                 codes = context.encode_image(prepared.pixels)
                 self.last_workspace_bytes = context.peak_workspace_bytes
-        return {"type": "image", "status": "ok", "shape": list(prepared.grid), "original_size": list(prepared.original_size), "processed_size": list(prepared.processed_size), "codes": codes.tolist(), **self._identities["image"]}
+        return {
+            "type": "image",
+            "status": "ok",
+            "shape": list(prepared.grid),
+            "original_size": list(prepared.original_size),
+            "processed_size": list(prepared.processed_size),
+            "codes": codes.tolist(),
+            **self._identities["image"],
+        }
 
     def iter_audio(self, source, *, cancel=None):
         from .audio import iter_feature_segments
+
         cancel = cancel or Cancellation()
         code_offset = 0
         iterator = iter_feature_segments(source, cancel=cancel.check)
@@ -138,24 +165,57 @@ class Tokenizer:
                     context = self.contexts["audio"]
                     context.library.lib.omni_context_reset_cancel(context.handle)
                     with cancel.bind(context):
-                        codes = context.encode_audio(features.mel, features.valid_frames)
+                        codes = context.encode_audio(
+                            features.mel, features.valid_frames
+                        )
                         self.last_workspace_bytes = context.peak_workspace_bytes
-                yield {"type": "audio", "status": "ok", "segment_index": segment.index,
-                       "start_sample": segment.start_sample, "valid_samples": segment.valid_samples,
-                       "padded_samples": features.padded_samples, "sample_rate": 16000,
-                       "code_offset": code_offset, "code_count": len(codes), "codes": codes.tolist(), **self._identities["audio"]}
+                yield {
+                    "type": "audio",
+                    "status": "ok",
+                    "segment_index": segment.index,
+                    "start_sample": segment.start_sample,
+                    "valid_samples": segment.valid_samples,
+                    "padded_samples": features.padded_samples,
+                    "sample_rate": 16000,
+                    "code_offset": code_offset,
+                    "code_count": len(codes),
+                    "codes": codes.tolist(),
+                    **self._identities["audio"],
+                }
                 code_offset += len(codes)
         finally:
             iterator.close()
 
     def encode_audio(self, source, *, cancel=None):
-        result = {"type": "audio", "status": "ok", "sample_rate": 16000, "valid_samples": 0, "codes": [], "segments": []}
+        result = {
+            "type": "audio",
+            "status": "ok",
+            "sample_rate": 16000,
+            "valid_samples": 0,
+            "codes": [],
+            "segments": [],
+        }
         for part in self.iter_audio(source, cancel=cancel):
             if len(result["codes"]) + len(part["codes"]) > self.max_codes:
-                raise TokenizationError("output_limit", "Aggregate code limit exceeded; use streaming output")
+                raise TokenizationError(
+                    "output_limit",
+                    "Aggregate code limit exceeded; use streaming output",
+                )
             result["codes"].extend(part["codes"])
             result["valid_samples"] += part["valid_samples"]
-            result["segments"].append({key: part[key] for key in ("segment_index", "start_sample", "valid_samples", "padded_samples", "code_offset", "code_count")})
+            result["segments"].append(
+                {
+                    key: part[key]
+                    for key in (
+                        "segment_index",
+                        "start_sample",
+                        "valid_samples",
+                        "padded_samples",
+                        "code_offset",
+                        "code_count",
+                    )
+                }
+            )
         result.update(self._identities["audio"])
         return result
 
@@ -171,19 +231,28 @@ class Tokenizer:
                 encode = self.encode_audio if kind == "audio" else self.encode_image
                 yield {"item_id": item_id, **encode(item["source"], cancel=cancel)}
             except Exception as exc:
-                yield {"item_id": item_id, "type": kind, "status": "error", "error": error_record(exc)}
+                yield {
+                    "item_id": item_id,
+                    "type": kind,
+                    "status": "error",
+                    "error": error_record(exc),
+                }
 
     def encode_batch(self, items, *, cancel=None, max_items=16):
         bounded = []
         for item in items:
             if len(bounded) >= max_items:
-                raise TokenizationError("input_limit", "Aggregate batch item limit exceeded; use iter_batch")
+                raise TokenizationError(
+                    "input_limit", "Aggregate batch item limit exceeded; use iter_batch"
+                )
             bounded.append(item)
         results, count = [], 0
         for result in self.iter_batch(bounded, cancel=cancel):
             count += len(result.get("codes", []))
             if count > self.max_codes:
-                raise TokenizationError("output_limit", "Aggregate code limit exceeded; use iter_batch")
+                raise TokenizationError(
+                    "output_limit", "Aggregate code limit exceeded; use iter_batch"
+                )
             results.append(result)
         return results
 
@@ -208,9 +277,21 @@ def error_record(exc):
     if isinstance(exc, TokenizationError):
         code = exc.code
     elif isinstance(exc, NativeError):
-        code = {1: "invalid_input", 2: "io_error", 3: "invalid_model", 4: "unsupported", 5: "out_of_memory", 6: "cancelled"}.get(exc.status, "inference_error")
+        code = {
+            1: "invalid_input",
+            2: "io_error",
+            3: "invalid_model",
+            4: "unsupported",
+            5: "out_of_memory",
+            6: "cancelled",
+        }.get(exc.status, "inference_error")
     elif isinstance(exc, (ValueError, OSError)):
         code = getattr(exc, "code", "invalid_media")
     else:
         code = "internal_error"
-    return {"code": code, "message": str(exc) if code != "internal_error" else "Internal tokenization error"}
+    return {
+        "code": code,
+        "message": str(exc)
+        if code != "internal_error"
+        else "Internal tokenization error",
+    }

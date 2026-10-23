@@ -21,19 +21,30 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: python -m pip install numpy pillow pytest httpx starlette python-multipart setuptools wheel cmake ninja
+        run: python -m pip install numpy pillow pytest httpx starlette python-multipart setuptools wheel build cmake ninja
       - name: Configure CPU runtime
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOMNI_CUDA=OFF
       - name: Build
         run: cmake --build build --config Release --parallel 3
       - name: C ABI tests
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install CMake package
+        run: cmake --install build --config Release --prefix install
+      - name: Build external CMake consumer
+        run: >-
+          cmake -S tests/cmake-consumer -B build-consumer
+          -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+      - name: Link external CMake consumer
+        run: cmake --build build-consumer --config Release --parallel 2
       - name: Python and complete synthetic model tests
         run: python -m pytest -q
         env:
           OMNI_REQUIRE_NATIVE: '1'
-      - name: Build platform wheel
-        run: python -m pip wheel . --no-deps --no-build-isolation -w dist
+      - name: Build source distribution
+        run: python -m build --sdist --no-isolation --outdir dist
+      - name: Build platform wheel from source distribution
+        shell: bash
+        run: python -m pip wheel dist/*.tar.gz --no-deps --no-build-isolation -w dist
       - name: Verify installed wheel outside source tree
         shell: bash
         run: |
@@ -56,6 +67,6 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build g++
       - uses: actions/checkout@v4
       - name: Compile CUDA backend without a GPU
-        run: cmake -S . -B build -G Ninja -DOMNI_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 3
+        run: cmake -S . -B build -G Ninja -DOMNI_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 3
       - name: Test C ABI error handling only
         run: ctest --test-dir build --output-on-failure
