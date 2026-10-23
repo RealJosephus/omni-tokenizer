@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {"major": 3, "minor": 24, "patch": 0},
+  "configurePresets": [
+    {"name": "cpu", "generator": "Ninja", "binaryDir": "${sourceDir}/build-cpu", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "OMNI_CUDA": "OFF"}},
+    {"name": "cuda", "inherits": "cpu", "binaryDir": "${sourceDir}/build-cuda", "cacheVariables": {"OMNI_CUDA": "ON", "CMAKE_CUDA_ARCHITECTURES": "80;86;89;90"}}
+  ],
+  "buildPresets": [{"name": "cpu", "configurePreset": "cpu"}, {"name": "cuda", "configurePreset": "cuda"}],
+  "testPresets": [{"name": "cpu", "configurePreset": "cpu", "output": {"outputOnFailure": true}}, {"name": "cuda", "configurePreset": "cuda", "output": {"outputOnFailure": true}}]
+}

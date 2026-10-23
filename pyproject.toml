@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "cmake>=3.24", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-tokenizer"
+version = "0.1.0"
+description = "Native VQWhisper and VQSigLIP inference with bounded media streaming"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "Pillow>=10"]
+
+[project.optional-dependencies]
+server = ["starlette>=0.40", "uvicorn>=0.30", "python-multipart>=0.0.20"]
+convert = ["torch>=2.4", "safetensors>=0.4"]
+test = ["pytest>=8", "httpx>=0.27", "starlette>=0.40", "python-multipart>=0.0.20"]
+
+[project.scripts]
+omni-tokenizer = "omni_tokenizer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+omni_tokenizer = ["_native/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python", "."]

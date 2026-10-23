@@ -1,0 +1,18 @@
+/.local/
+
+# Build products and Python caches.
+/build*/
+/dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+.venv/
+/CMakeUserPresets.json
+/models/
+/checkpoints/
+*.otm
+*.safetensors
+*.pth
+*.pt
