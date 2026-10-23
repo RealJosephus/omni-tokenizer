@@ -33,6 +33,87 @@ def wav_bytes(samples, *, rate=16000, width=2):
 
 
 class AudioTests(unittest.TestCase):
+    def test_pcm_bytes_decode_without_files(self):
+        samples = np.arange(2000, dtype="<i2")
+        chunks = list(
+            iter_decoded_chunks(wav_bytes(samples).getvalue(), block_frames=173)
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([chunk for chunk, _ in chunks]),
+            samples.astype(np.float32) / 32768,
+        )
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is optional"
+    )
+    def test_compressed_bytes_use_memory_pipes_and_release_on_close(self):
+        from unittest.mock import patch
+
+        samples = np.arange(4401, dtype="<i2")
+        encoded = subprocess.run(
+            [
+                shutil.which("ffmpeg"),
+                "-v",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "flac",
+                "pipe:1",
+            ],
+            input=wav_bytes(samples, rate=44100).getvalue(),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        with (
+            patch.object(
+                tempfile,
+                "TemporaryFile",
+                side_effect=AssertionError("No media spooling"),
+            ),
+            patch.object(
+                tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("No media directory"),
+            ),
+        ):
+            chunks = list(iter_decoded_chunks(encoded, block_frames=317))
+            np.testing.assert_array_equal(
+                np.concatenate([chunk for chunk, _ in chunks]),
+                samples.astype(np.float32) / 32768,
+            )
+            assert all(rate == 44100 for _, rate in chunks)
+            iterator = iter_decoded_chunks(encoded, block_frames=37)
+            assert next(iterator)[0].size == 37
+            iterator.close()
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is optional"
+    )
+    def test_mp3_bytes_are_decoded_and_resampled(self):
+        samples = (np.sin(np.arange(44100) * 0.02) * 10000).astype("<i2")
+        encoded = subprocess.run(
+            [
+                shutil.which("ffmpeg"),
+                "-v",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ],
+            input=wav_bytes(samples, rate=44100).getvalue(),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        segments = list(iter_audio_segments(encoded))
+        assert len(segments) == 1
+        assert 16000 <= segments[0].valid_samples < 18000
+        assert np.isfinite(segments[0].samples).all()
+
     def test_first_channel_and_integer_pcm(self):
         stereo = np.array([[-32768, 2000], [0, 3000], [32767, 4000]], dtype="<i2")
         decoded = list(iter_decoded_chunks(wav_bytes(stereo), block_frames=2))

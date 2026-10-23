@@ -21,7 +21,7 @@ omni-tokenizer = "omni_tokenizer.cli:main"
 where = ["python"]
 
 [tool.setuptools.package-data]
-omni_tokenizer = ["_native/*"]
+omni_tokenizer = ["_native/*", "web/*.html", "web/*.css", "web/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

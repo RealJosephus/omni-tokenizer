@@ -12,6 +12,12 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from .image import (
+    DEFAULT_MAX_LONG_EDGE,
+    DEFAULT_MAX_PIXELS,
+    DEFAULT_MIN_SHORT_EDGE,
+    validate_image_options,
+)
 from .protocol import encode_binary, encode_frame, token_text
 from .runtime import Cancellation, Tokenizer, error_record
 
@@ -32,6 +38,29 @@ def _parser():
         help="cpu or cuda:N; precision does not change automatically",
     )
     parser.add_argument("--library", default=os.environ.get("OMNI_LIBRARY"))
+    parser.add_argument(
+        "--image-min-short-edge",
+        type=int,
+        default=DEFAULT_MIN_SHORT_EDGE,
+        help="Image short-edge resize target in pixels (default: 384)",
+    )
+    parser.add_argument(
+        "--image-max-long-edge",
+        type=int,
+        default=DEFAULT_MAX_LONG_EDGE,
+        help="Image long-edge limit in pixels (default: 1152)",
+    )
+    parser.add_argument(
+        "--image-no-resize",
+        action="store_true",
+        help="Preserve patch-aligned image pixels within the long-edge limit",
+    )
+    parser.add_argument(
+        "--max-image-pixels",
+        type=int,
+        default=DEFAULT_MAX_PIXELS,
+        help="Decoded and processed image pixel budget (default: 64000000)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="Inspect a converted model manifest")
     inspect.add_argument("model")
@@ -65,6 +94,12 @@ def _parser():
     serve.add_argument("--api-key", default=os.environ.get("OMNI_API_KEY"))
     serve.add_argument("--max-requests", type=int, default=4)
     serve.add_argument("--max-upload-bytes", type=int, default=4 * 1024**3)
+    serve.add_argument(
+        "--max-json-bytes",
+        type=int,
+        default=16 * 1024**2,
+        help="JSON, remote image, and WebUI body byte limit",
+    )
     serve.add_argument("--allow-url-host", action="append", default=[])
     return parser
 
@@ -134,9 +169,13 @@ def _batch(engine, args, output):
             if not line.strip():
                 continue
             item = json.loads(line)
-            if not isinstance(item, dict) or set(item) != {"item_id", "type", "path"}:
+            if (
+                not isinstance(item, dict)
+                or not {"item_id", "type", "path"} <= set(item)
+                or set(item) - {"item_id", "type", "path", "image_options"}
+            ):
                 raise ValueError(
-                    f"Batch line {index + 1}: expected item_id, type and path"
+                    f"Batch line {index + 1}: expected item_id, type, path and optional image_options"
                 )
             item_id = item["item_id"]
             if not isinstance(item_id, str) or not item_id or item_id in seen:
@@ -151,11 +190,21 @@ def _batch(engine, args, output):
             path = Path(item["path"])
             if not path.is_absolute():
                 path = Path(args.input).resolve().parent / path
+            options = validate_image_options(item.get("image_options", {}))
+            if "image_options" in item and item["type"] != "image":
+                raise ValueError("image_options requires an image item")
             try:
                 if args.format == "stream":
                     for frame in _frames(
                         engine,
-                        [{"item_id": item_id, "type": item["type"], "source": path}],
+                        [
+                            {
+                                "item_id": item_id,
+                                "type": item["type"],
+                                "source": path,
+                                "image_options": options,
+                            }
+                        ],
                         Cancellation(),
                     ):
                         if frame["frame"] != "done":
@@ -166,7 +215,7 @@ def _batch(engine, args, output):
                         engine.encode_image
                         if item["type"] == "image"
                         else engine.encode_audio
-                    )(path)
+                    )(path, **options)
                     output.write(_dump({"item_id": item_id, **result}) + b"\n")
             except Exception as exc:
                 any_error = True
@@ -197,13 +246,20 @@ def main(argv=None):
             image_model=args.image_model,
             device=args.device,
             library=args.library,
+            image_min_short_edge=args.image_min_short_edge,
+            image_max_long_edge=args.image_max_long_edge,
+            image_resize=not args.image_no_resize,
+            max_image_pixels=args.max_image_pixels,
         ) as engine:
             if args.command == "serve":
                 import uvicorn
 
                 from .server import Limits, create_app
 
-                if args.max_requests <= 0 or args.max_upload_bytes <= 0:
+                if (
+                    min(args.max_requests, args.max_upload_bytes, args.max_json_bytes)
+                    <= 0
+                ):
                     raise ValueError("Limits must be positive")
                 uvicorn.run(
                     create_app(
@@ -211,6 +267,7 @@ def main(argv=None):
                         limits=Limits(
                             max_requests=args.max_requests,
                             max_upload_bytes=args.max_upload_bytes,
+                            max_json_bytes=args.max_json_bytes,
                             url_hosts=tuple(args.allow_url_host),
                         ),
                         api_key=args.api_key,

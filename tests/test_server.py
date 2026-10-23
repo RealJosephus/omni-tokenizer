@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import threading
+import time
 
 import pytest
+from omni_tokenizer.image import ImageOptions
 from omni_tokenizer.protocol import BINARY_MEDIA_TYPE, FrameDecoder, decode_binary
 from omni_tokenizer.runtime import TokenizationError
 from omni_tokenizer.server import Limits, create_app
@@ -11,8 +13,8 @@ from starlette.testclient import TestClient
 
 
 class Engine:
-    def encode_image(self, source, cancel=None):
-        if source.read_bytes() == b"bad":
+    def encode_image(self, source, cancel=None, resize=True):
+        if (source if isinstance(source, bytes) else source.read_bytes()) == b"bad":
             raise ValueError("Invalid image")
         return {
             "type": "image",
@@ -301,6 +303,186 @@ def test_stream_backpressure_and_disconnect_cleanup():
         await inbox.put({"type": "http.disconnect"})
         await asyncio.wait_for(task, 5)
         assert closed.is_set()
+        with TestClient(app) as client:
+            assert client.get("/health").json()["active_requests"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_webui_assets_and_no_store(client):
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'data-upload-limit="16777216"' in page.text
+    assert 'id="crop-canvas"' in page.text
+    for path, content_type in (
+        ("/", "text/html"),
+        ("/ui/app.js", "text/javascript"),
+        ("/ui/style.css", "text/css"),
+    ):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(content_type)
+        assert response.headers["cache-control"] == "no-store"
+        assert "connect-src 'self'" in response.headers["content-security-policy"]
+    assert client.get("/ui/server.py").status_code == 404
+
+
+def test_webui_receives_server_image_defaults_and_budget():
+    engine = Engine()
+    engine.image_options = ImageOptions(min_short_edge=512, max_long_edge=2048)
+    engine.max_image_pixels = 8_000_000
+    with TestClient(create_app(engine)) as client:
+        html = client.get("/").text
+        assert 'data-min-short-edge="512"' in html
+        assert 'data-max-long-edge="2048"' in html
+        assert 'data-max-image-pixels="8000000"' in html
+        assert "{{" not in html
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        [],
+        {"max_long_edge": True},
+        {"max_long_edge": "2048"},
+        {"min_short_edge": 17},
+        {"resize": 1},
+        {"max_image_pixels": 1},
+    ],
+)
+def test_http_rejects_invalid_image_options(client, options):
+    value = item()
+    value["image_options"] = options
+    assert (
+        client.post("/v1/tokenize", json={"version": 1, "items": [value]}).status_code
+        == 400
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "max_long_edge=x",
+        "max_long_edge=17",
+        "max_long_edge=2048&max_long_edge=4096",
+        "max_image_pixels=999999999",
+    ],
+)
+def test_webui_rejects_invalid_policy_queries(client, query):
+    response = client.post(
+        "/ui/encode?" + query, content=b"media", headers={"Content-Type": "image/png"}
+    )
+    assert response.status_code == 400
+    assert client.get("/health").json()["active_requests"] == 0
+
+
+def test_webui_uses_memory_and_reports_encoding_time(monkeypatch):
+    def no_directory(*args, **kwargs):
+        raise AssertionError("WebUI must not create a media directory")
+
+    class MemoryEngine(Engine):
+        def encode_image(self, source, cancel=None, resize=True):
+            assert isinstance(source, bytes)
+            assert resize is False
+            time.sleep(0.01)
+            return super().encode_image(source, cancel)
+
+        def encode_audio(self, source, cancel=None):
+            assert isinstance(source, bytes)
+            return super().encode_audio(source, cancel)
+
+    monkeypatch.setattr(
+        "omni_tokenizer.server.tempfile.TemporaryDirectory", no_directory
+    )
+    with TestClient(create_app(MemoryEngine())) as client:
+        for media_type, expected in (
+            ("image/png", "<|image_7|><|image_8|>\n<|image_9|><|image_10|>"),
+            ("audio/wav", "<|audio_17|><|audio_230|><|audio_18|><|audio_230|>"),
+        ):
+            response = client.post(
+                "/ui/encode", content=b"media", headers={"Content-Type": media_type}
+            )
+            assert response.status_code == 200
+            result = response.json()
+            assert result["text"] == expected and result["code_count"] == 4
+            assert result["inference_ms"] >= 0
+            if media_type == "image/png":
+                assert result["inference_ms"] >= 10
+            assert response.headers["server-timing"].startswith("inference;dur=")
+            assert response.headers["cache-control"] == "no-store"
+            assert client.get("/health").json()["active_requests"] == 0
+        bad = client.post(
+            "/ui/encode", content=b"bad", headers={"Content-Type": "image/png"}
+        )
+        assert bad.status_code == 422 and "text" not in bad.json()
+
+
+def test_webui_auth_limits_and_failed_requests_release_admission():
+    with TestClient(
+        create_app(Engine(), limits=Limits(max_json_bytes=4), api_key="test")
+    ) as client:
+        assert client.get("/").status_code == 200
+        assert client.post("/ui/encode", content=b"x").status_code == 401
+        headers = {"Authorization": "Bearer test", "Content-Type": "image/png"}
+        for body, status in (
+            (b"12345", 413),
+            (b"", 400),
+            (b"bad", 422),
+            (b"good", 200),
+        ):
+            response = client.post("/ui/encode", content=body, headers=headers)
+            assert response.status_code == status
+            assert response.headers["cache-control"] == "no-store"
+            assert client.get("/health").json()["active_requests"] == 0
+        headers["Content-Type"] = "text/plain"
+        assert (
+            client.post("/ui/encode", content=b"text", headers=headers).status_code
+            == 415
+        )
+
+
+def test_webui_disconnect_cancels_work_and_releases_memory(monkeypatch):
+    entered, cancelled = threading.Event(), threading.Event()
+
+    class Waiting(Engine):
+        def encode_image(self, source, cancel=None, resize=True):
+            assert isinstance(source, bytes)
+            assert resize is False
+            entered.set()
+            assert cancel.event.wait(5)
+            cancelled.set()
+            cancel.check()
+
+    async def scenario():
+        app = create_app(Waiting())
+        inbox = asyncio.Queue()
+        await inbox.put({"type": "http.request", "body": b"media", "more_body": False})
+
+        async def receive():
+            return await inbox.get()
+
+        async def send(message):
+            pass
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/ui/encode",
+            "raw_path": b"/ui/encode",
+            "query_string": b"",
+            "headers": [(b"content-type", b"image/png")],
+            "server": ("test", 80),
+            "client": ("test", 123),
+        }
+        task = asyncio.create_task(app(scope, receive, send))
+        assert await asyncio.to_thread(entered.wait, 5)
+        await inbox.put({"type": "http.disconnect"})
+        await asyncio.wait_for(task, 5)
+        assert cancelled.is_set()
         with TestClient(app) as client:
             assert client.get("/health").json()["active_requests"] == 0
 

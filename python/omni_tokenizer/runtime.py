@@ -6,6 +6,12 @@ import json
 import threading
 from contextlib import contextmanager
 
+from .image import (
+    DEFAULT_MAX_LONG_EDGE,
+    DEFAULT_MAX_PIXELS,
+    DEFAULT_MIN_SHORT_EDGE,
+    ImageOptions,
+)
 from .native import Library, Model, NativeError
 
 
@@ -58,7 +64,17 @@ class Tokenizer:
         device="cpu",
         library=None,
         max_codes=2_000_000,
+        image_min_short_edge=DEFAULT_MIN_SHORT_EDGE,
+        image_max_long_edge=DEFAULT_MAX_LONG_EDGE,
+        image_resize=True,
+        max_image_pixels=DEFAULT_MAX_PIXELS,
     ):
+        self.image_options = ImageOptions(
+            image_resize, image_min_short_edge, image_max_long_edge
+        )
+        if type(max_image_pixels) is not int or max_image_pixels <= 0:
+            raise ValueError("max_image_pixels must be a positive integer")
+        self.max_image_pixels = max_image_pixels
         self.paths = {"audio": audio_model, "image": image_model}
         self.device = device
         self.library_path = library
@@ -128,12 +144,33 @@ class Tokenizer:
             }
         return self.models[kind]
 
-    def encode_image(self, source, *, cancel=None):
+    def encode_image(
+        self,
+        source,
+        *,
+        cancel=None,
+        resize=None,
+        min_short_edge=None,
+        max_long_edge=None,
+    ):
         from .image import prepare_image
 
         cancel = cancel or Cancellation()
         cancel.check()
-        prepared = prepare_image(source)
+        options = self.image_options.updated(
+            {
+                key: value
+                for key, value in {
+                    "resize": resize,
+                    "min_short_edge": min_short_edge,
+                    "max_long_edge": max_long_edge,
+                }.items()
+                if value is not None
+            }
+        )
+        prepared = prepare_image(
+            source, max_pixels=self.max_image_pixels, **options.as_dict()
+        )
         with self._compute(cancel):
             self._model("image")
             context = self.contexts["image"]
@@ -149,6 +186,8 @@ class Tokenizer:
             "processed_size": list(prepared.processed_size),
             "codes": codes.tolist(),
             **self._identities["image"],
+            "preprocessing": options.profile,
+            "image_options": options.as_dict(),
         }
 
     def iter_audio(self, source, *, cancel=None):
@@ -229,7 +268,18 @@ class Tokenizer:
                 if kind not in {"audio", "image"}:
                     raise ValueError("Batch type must be audio or image")
                 encode = self.encode_audio if kind == "audio" else self.encode_image
-                yield {"item_id": item_id, **encode(item["source"], cancel=cancel)}
+                options = item.get("image_options", {})
+                if kind != "image" and "image_options" in item:
+                    raise ValueError("image_options requires an image item")
+                options = (
+                    self.image_options.updated(options).as_dict()
+                    if kind == "image"
+                    else {}
+                )
+                yield {
+                    "item_id": item_id,
+                    **encode(item["source"], cancel=cancel, **options),
+                }
             except Exception as exc:
                 yield {
                     "item_id": item_id,

@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 import shutil
@@ -121,6 +123,131 @@ def test_mixed_batch_order_errors_and_context_reuse(tokenizer, runtime_inputs):
     assert len(aggregated[2]["codes"]) == 864
     assert len(aggregated[4]["codes"]) == 2
     assert all(tokenizer.contexts[key] is value for key, value in contexts.items())
+
+
+def test_explicit_image_size_reaches_native_encoder_without_auto_resize(
+    tokenizer, runtime_inputs
+):
+    source = runtime_inputs / "image.png"
+    result = tokenizer.encode_image(source.read_bytes(), resize=False)
+    assert result["processed_size"] == [48, 32]
+    assert result["shape"] == [3, 2]
+    assert len(result["codes"]) == 6
+    assert result["preprocessing"] == "image-rgb-native-size-v1"
+    standard = tokenizer.encode_image(source)
+    assert standard["shape"] == [36, 24]
+    assert standard["preprocessing"] == "image-pillow-v1"
+
+
+def test_image_instance_defaults_overrides_and_budget(runtime_library, runtime_inputs):
+    with Tokenizer(
+        image_model=runtime_inputs / "models/image",
+        library=runtime_library.path,
+        image_min_short_edge=16,
+        image_max_long_edge=1536,
+    ) as engine:
+        image = Image.new("RGB", (2048, 32), (17, 113, 231))
+        first = engine.encode_image(image)
+        assert first["processed_size"] == [32, 1536]
+        override = engine.encode_image(image, max_long_edge=2048, resize=False)
+        assert override["shape"] == [2, 128]
+        assert override["image_options"]["max_long_edge"] == 2048
+        assert engine.encode_image(image)["codes"] == first["codes"]
+        assert engine.image_options.max_long_edge == 1536
+        batch = engine.encode_batch(
+            [
+                {
+                    "item_id": "custom",
+                    "type": "image",
+                    "source": image,
+                    "image_options": {"resize": False, "max_long_edge": 2048},
+                },
+                {"item_id": "default", "type": "image", "source": image},
+            ]
+        )
+        assert [item["codes"] for item in batch] == [
+            override["codes"],
+            first["codes"],
+        ]
+        engine.max_image_pixels = 256
+        with pytest.raises(ValueError, match="Processed image"):
+            engine.encode_image(Image.new("RGB", (16, 16)), min_short_edge=512)
+
+
+def test_http_image_options_reach_native_in_all_formats(tokenizer):
+    from omni_tokenizer.protocol import FrameDecoder
+    from omni_tokenizer.server import create_app
+    from starlette.testclient import TestClient
+
+    image = io.BytesIO()
+    Image.new("RGB", (1536, 32), (17, 113, 231)).save(image, format="PNG")
+    body = image.getvalue()
+    data = base64.b64encode(body).decode("ascii")
+    options = {"resize": False, "max_long_edge": 2048}
+    with TestClient(create_app(tokenizer)) as client:
+        item = {
+            "item_id": "image",
+            "type": "image",
+            "data": data,
+            "image_options": options,
+        }
+        request = {"version": 1, "items": [item]}
+        response = client.post("/v1/tokenize", json=request)
+        result = response.json()["items"][0]
+        assert result["processed_size"] == [32, 1536]
+        assert len(result["codes"]) == 192
+        multipart_item = {key: value for key, value in item.items() if key != "data"}
+        response = client.post(
+            "/v1/tokenize",
+            data={
+                "manifest": json.dumps(
+                    {"version": 1, "items": [{**multipart_item, "part": "upload"}]}
+                )
+            },
+            files={"upload": ("image.png", body, "image/png")},
+        )
+        assert response.json()["items"][0] == result
+        decoder = FrameDecoder()
+        frames = decoder.feed(
+            client.post("/v1/tokenize", json={**request, "stream": True}).content
+        )
+        decoder.finish()
+        assert (
+            next(frame for frame in frames if frame["frame"] == "data")["codes"]
+            == result["codes"]
+        )
+        chat = {
+            "image_options": options,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64," + data},
+                        }
+                    ],
+                }
+            ],
+        }
+        response = client.post("/v1/chat/completions", json=chat)
+        assert response.status_code == 200
+        assert (
+            response.json()["choices"][0]["message"]["content"].count("<|image_") == 192
+        )
+        stream = client.post("/v1/chat/completions", json={**chat, "stream": True})
+        assert stream.text.count("<|image_") == 192
+        assert stream.text.endswith("data: [DONE]\n\n")
+        headers = {"Content-Type": "image/png"}
+        assert (
+            client.post("/ui/encode", content=body, headers=headers).status_code == 422
+        )
+        response = client.post(
+            "/ui/encode?max_long_edge=2048", content=body, headers=headers
+        )
+        assert response.status_code == 200
+        assert response.json()["shape"] == [2, 96]
+        assert response.json()["image_options"]["resize"] is False
 
 
 def test_batch_iterator_applies_backpressure(tokenizer, runtime_inputs):

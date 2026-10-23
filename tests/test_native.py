@@ -69,6 +69,36 @@ def test_unicode_model_path(library, models, tmp_path):
         assert model.info.kind == 1
 
 
+@pytest.mark.parametrize("size", [(32, 1536), (1536, 32)])
+def test_native_image_dimensions_above_default_limit(library, models, size):
+    with Model(library, models / "image") as model, model.context() as context:
+        codes = context.encode_image(np.zeros((3, *size), np.float32))
+        assert len(codes) == size[0] * size[1] // 256
+        assert np.isfinite(context.features(len(codes))).all()
+
+
+def test_native_image_index_bounds_are_checked_before_input_access(library, models):
+    with Model(library, models / "image") as model, model.context() as context:
+        pixel, code, count = C.c_float(), C.c_uint16(), C.c_size_t()
+        for height, width in ((0xFFFFFFF0, 16), (0xFFFFFFF0, 0xFFFFFFF0)):
+            status = library.lib.omni_encode_image(
+                context.handle,
+                C.byref(pixel),
+                height,
+                width,
+                C.byref(code),
+                1,
+                C.byref(count),
+            )
+            assert status == 1
+            assert b"indexing capacity" in library.lib.omni_last_error()
+        status = library.lib.omni_encode_image(
+            context.handle, C.byref(pixel), 16, 2048, C.byref(code), 0, C.byref(count)
+        )
+        assert status == 1 and count.value == 128
+        assert b"capacity is too small" in library.lib.omni_last_error()
+
+
 def test_contexts_retain_weights_after_model_handle_is_freed(library, models):
     with np.load(models / "audio" / "expected.npz") as expected:
         model = Model(library, models / "audio")

@@ -221,9 +221,9 @@ class Context:
         if (
             pixels.ndim != 3
             or pixels.shape[0] != 3
-            or not all(0 < x <= 1152 for x in pixels.shape[1:])
+            or not all(0 < x <= 0xFFFFFFFF for x in pixels.shape[1:])
         ):
-            raise ValueError("Expected RGB CHW pixels no larger than 1152 per side")
+            raise ValueError("Expected RGB CHW pixels with positive uint32 dimensions")
         h, w = pixels.shape[1:]
         return self._encode(self.library.lib.omni_encode_image, pixels, h, w, h * w)
 

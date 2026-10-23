@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace omni {
 namespace {
@@ -251,10 +252,21 @@ int omni_encode_image(omni_context *c, const float *pixels, uint32_t height, uin
         omni::require(c && pixels && count, "Invalid image pointers");
         auto &cfg = c->impl.model->cfg;
         omni::require(cfg.kind == OMNI_IMAGE, "Model is not an image tokenizer");
-        omni::require(height > 0 && width > 0 && height <= 1152 && width <= 1152 &&
+        omni::require(height > 0 && width > 0 &&
                           height % cfg.patch_size == 0 && width % cfg.patch_size == 0,
                       "Invalid image dimensions");
-        *count = size_t(height / cfg.patch_size) * (width / cfg.patch_size);
+        const uint64_t patches = uint64_t(height / cfg.patch_size) * (width / cfg.patch_size);
+        // Cover activations, packed pixels, attention tiles and VQ tiles before
+        // any allocation or input read; BLAS dimensions use signed int indices.
+        const uint64_t columns = std::max({uint64_t(8) * cfg.patch_size * cfg.patch_size,
+                                          uint64_t(3) * cfg.width, uint64_t(cfg.ffn),
+                                          uint64_t(cfg.code_dim), uint64_t(128) * cfg.heads,
+                                          uint64_t(1024)});
+        const uint64_t elements = std::min(uint64_t(std::numeric_limits<int>::max()),
+                                          uint64_t(std::numeric_limits<size_t>::max() / sizeof(float)));
+        omni::require(patches <= elements / columns,
+                      "Image dimensions exceed native tensor indexing capacity");
+        *count = size_t(patches);
         omni::require(codes && capacity >= *count, "Output capacity is too small");
         Running guard(c->impl);
         c->impl.features = {};

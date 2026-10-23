@@ -9,13 +9,13 @@ on the longest waveform in a batch. It is not bit-exact to its CUDA STFT.
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
 import queue
 import shutil
 import subprocess
-import tempfile
 import threading
 import wave
 from dataclasses import dataclass
@@ -177,13 +177,15 @@ def _pcm_first_channel(raw: bytes, sample_width: int, channels: int) -> np.ndarr
 
 
 def _iter_ffmpeg(
-    path: Path, block_frames: int, cancel: CancelCheck
+    path: Path | bytes, block_frames: int, cancel: CancelCheck
 ) -> Iterator[tuple[np.ndarray, int]]:
     executable, probe = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if executable is None or probe is None:
         raise AudioError(
             "This audio format requires ffmpeg and ffprobe on PATH; PCM WAV works without them"
         )
+    media = path if isinstance(path, bytes) else None
+    input_name = "pipe:0" if media is not None else str(path)
     try:
         result = subprocess.run(
             [
@@ -196,8 +198,10 @@ def _iter_ffmpeg(
                 "stream=sample_rate",
                 "-of",
                 "json",
-                str(path),
+                *(["-protocol_whitelist", "pipe"] if media is not None else []),
+                input_name,
             ],
+            input=media,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=30,
@@ -212,109 +216,146 @@ def _iter_ffmpeg(
     if not 1 <= sample_rate <= 384000:
         raise AudioError("Unsupported audio sample rate")
     # Keep the original rate: the same continuous resampler handles every codec.
-    with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(
-            [
-                executable,
-                "-v",
-                "error",
-                "-nostdin",
-                "-i",
-                str(path),
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-af",
-                "pan=mono|c0=c0",
-                "-f",
-                "f32le",
-                "-acodec",
-                "pcm_f32le",
-                "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=errors,
-        )
-        pending = queue.Queue(maxsize=2)
-        stopped = threading.Event()
+    # Drain diagnostics into a bounded memory buffer, including for file inputs.
+    errors = bytearray()
+    process = subprocess.Popen(
+        [
+            executable,
+            "-v",
+            "error",
+            "-nostdin",
+            *(["-protocol_whitelist", "pipe"] if media is not None else []),
+            "-i",
+            input_name,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-af",
+            "pan=mono|c0=c0",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "pipe:1",
+        ],
+        stdin=subprocess.PIPE if media is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pending = queue.Queue(maxsize=2)
+    stopped = threading.Event()
 
-        def read_pipe():
+    def feed_pipe():
+        try:
+            for begin in range(0, len(media), 65536):
+                if stopped.is_set():
+                    break
+                process.stdin.write(media[begin : begin + 65536])
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    def read_errors():
+        while chunk := process.stderr.read(4096):
+            errors.extend(chunk[: max(0, 4096 - len(errors))])
+
+    def read_pipe():
+        while not stopped.is_set():
+            try:
+                item = process.stdout.read(block_frames * 4)
+            except Exception as exc:
+                item = exc
             while not stopped.is_set():
                 try:
-                    item = process.stdout.read(block_frames * 4)
-                except Exception as exc:
-                    item = exc
-                while not stopped.is_set():
-                    try:
-                        pending.put(item, timeout=0.1)
-                        break
-                    except queue.Full:
-                        pass
-                if not item or isinstance(item, Exception):
-                    return
-
-        reader_thread = threading.Thread(target=read_pipe, daemon=True)
-        reader_thread.start()
-        try:
-            while True:
-                _check_cancel(cancel)
-                try:
-                    raw = pending.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if isinstance(raw, Exception):
-                    raise AudioError("Could not read decoder output") from raw
-                if not raw:
+                    pending.put(item, timeout=0.1)
                     break
-                if len(raw) % 4:
-                    raise AudioError("Decoder returned a truncated PCM sample")
-                samples = np.frombuffer(raw, "<f4").astype(np.float32, copy=True)
-                if not np.isfinite(samples).all():
-                    raise AudioError("Decoded audio contains non-finite samples")
-                yield samples, sample_rate
-            if process.wait(timeout=30) != 0:
-                errors.seek(0)
-                detail = errors.read(4096).decode("utf-8", "replace").strip()
-                raise AudioError(f"Audio decoder failed: {detail}")
-        finally:
-            stopped.set()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            process.stdout.close()
-            reader_thread.join(timeout=3)
+                except queue.Full:
+                    pass
+            if not item or isinstance(item, Exception):
+                return
+
+    reader_thread = threading.Thread(target=read_pipe, daemon=True)
+    error_thread = threading.Thread(target=read_errors, daemon=True)
+    writer_thread = (
+        threading.Thread(target=feed_pipe, daemon=True) if media is not None else None
+    )
+    reader_thread.start()
+    error_thread.start()
+    if writer_thread is not None:
+        writer_thread.start()
+    try:
+        while True:
+            _check_cancel(cancel)
+            try:
+                raw = pending.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if isinstance(raw, Exception):
+                raise AudioError("Could not read decoder output") from raw
+            if not raw:
+                break
+            if len(raw) % 4:
+                raise AudioError("Decoder returned a truncated PCM sample")
+            samples = np.frombuffer(raw, "<f4").astype(np.float32, copy=True)
+            if not np.isfinite(samples).all():
+                raise AudioError("Decoded audio contains non-finite samples")
+            yield samples, sample_rate
+        if process.wait(timeout=30) != 0:
+            error_thread.join(timeout=3)
+            detail = errors.decode("utf-8", "replace").strip()
+            raise AudioError(f"Audio decoder failed: {detail}")
+    finally:
+        stopped.set()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        process.stdout.close()
+        reader_thread.join(timeout=3)
+        error_thread.join(timeout=3)
+        process.stderr.close()
+        if writer_thread is not None:
+            writer_thread.join(timeout=3)
 
 
 def iter_decoded_chunks(
-    source: str | os.PathLike[str] | BinaryIO,
+    source: str | os.PathLike[str] | BinaryIO | bytes,
     *,
     block_frames: int = 65536,
     cancel: CancelCheck = None,
 ) -> Iterator[tuple[np.ndarray, int]]:
     """Read bounded first-channel PCM chunks; optional FFmpeg handles other files.
 
-    Binary streams must contain seekable PCM WAV. Other codecs are accepted as
-    local paths, allowing containers that need seeking without buffering them
-    in memory. Closing the generator also closes its decoder subprocess.
+    Binary streams must contain seekable PCM WAV. Encoded bytes use memory pipes
+    for other codecs; file paths also support containers requiring seeking.
+    Closing the generator also closes its decoder subprocess.
     """
     if not 1 <= block_frames <= 1048576:
         raise AudioError("block_frames must be between 1 and 1048576")
     _check_cancel(cancel)
     path = Path(source).resolve() if isinstance(source, (str, os.PathLike)) else None
+    media = source if isinstance(source, bytes) else None
+    if media is not None:
+        source = io.BytesIO(media)
     if path is not None and not path.is_file():
         raise AudioError("Audio file does not exist")
     try:
         reader = wave.open(str(path) if path is not None else source, "rb")
     except (wave.Error, EOFError) as exc:
-        if path is None:
+        if path is None and media is None:
             raise AudioError(
                 "Binary streams must contain a supported PCM WAV file"
             ) from exc
-        yield from _iter_ffmpeg(path, block_frames, cancel)
+        yield from _iter_ffmpeg(
+            media if media is not None else path, block_frames, cancel
+        )
         return
     with reader:
         channels, width, rate = (
@@ -387,7 +428,7 @@ def segment_pcm(
 
 
 def iter_audio_segments(
-    source: str | os.PathLike[str] | BinaryIO,
+    source: str | os.PathLike[str] | BinaryIO | bytes,
     *,
     block_frames: int = 65536,
     cancel: CancelCheck = None,
@@ -479,7 +520,7 @@ def log_mel(samples: np.ndarray) -> AudioFeatures:
 
 
 def iter_feature_segments(
-    source: str | os.PathLike[str] | BinaryIO,
+    source: str | os.PathLike[str] | BinaryIO | bytes,
     *,
     block_frames: int = 65536,
     cancel: CancelCheck = None,

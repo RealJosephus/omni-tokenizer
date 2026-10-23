@@ -87,3 +87,66 @@ def test_inspect_verifies_the_explicit_file(tmp_path):
     assert cli._inspect(explicit, True)["verified"]
     with pytest.raises(ValueError, match="SHA-256"):
         cli._inspect(tmp_path, True)
+
+
+def test_cli_image_defaults_and_resource_budget_reach_tokenizer(monkeypatch, tmp_path):
+    captured = {}
+
+    def create(**options):
+        captured.update(options)
+        return nullcontext(Engine())
+
+    monkeypatch.setattr(cli, "Tokenizer", create)
+    assert (
+        cli.main(
+            [
+                "--image-min-short-edge",
+                "512",
+                "--image-max-long-edge",
+                "2048",
+                "--image-no-resize",
+                "--max-image-pixels",
+                "8000000",
+                "encode",
+                "image",
+                "image.png",
+                "-o",
+                str(tmp_path / "out"),
+            ]
+        )
+        == 0
+    )
+    assert captured["image_min_short_edge"] == 512
+    assert captured["image_max_long_edge"] == 2048
+    assert captured["image_resize"] is False
+    assert captured["max_image_pixels"] == 8000000
+
+
+@pytest.mark.parametrize("format", ["stream", "jsonl"])
+def test_cli_batch_passes_per_image_overrides(tmp_path, format):
+    calls = []
+
+    class Recording(Engine):
+        def encode_image(self, source, cancel=None, **options):
+            calls.append(options)
+            return super().encode_image(source, cancel)
+
+    source = tmp_path / "items.jsonl"
+    options = {"min_short_edge": 256, "max_long_edge": 2048, "resize": False}
+    source.write_text(
+        json.dumps(
+            {
+                "item_id": "a",
+                "type": "image",
+                "path": "image.png",
+                "image_options": options,
+            }
+        )
+    )
+    assert (
+        cli._batch(
+            Recording(), SimpleNamespace(input=source, format=format), io.BytesIO()
+        )
+        == 0
+    )
+    assert calls == [options]

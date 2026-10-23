@@ -1,7 +1,7 @@
 # omni-tokenizer
 
 Native VQWhisper and VQSigLIP encoding with a C++17 CPU/CUDA library,
-Python API, CLI, and HTTP service.
+Python API, CLI, and WebUI.
 
 ## Install
 
@@ -51,12 +51,12 @@ omni-tokenizer --image-model models/image --device cuda encode image image.png
 omni-tokenizer --audio-model models/audio --device cuda encode audio speech.wav --format stream -o audio.ovs
 ```
 
-For the HTTP service:
+For the HTTP service and WebUI:
 
 ```sh
 python -m pip install '.[server]'
 omni-tokenizer --audio-model models/audio --image-model models/image --device cuda serve
 ```
 
-See `omni-tokenizer --help` and each command's
+Open http://127.0.0.1:8000/. See `omni-tokenizer --help` and each command's
 `--help` for options.

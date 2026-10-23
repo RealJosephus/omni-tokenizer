@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Media tokenizer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/ui/style.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <main data-upload-limit="{{upload_limit}}" data-min-short-edge="{{min_short_edge}}" data-max-long-edge="{{max_long_edge}}" data-max-image-pixels="{{max_image_pixels}}">
+    <h1 class="sr-only">Media tokenizer</h1>
+    <div class="workspace">
+      <section class="panel input-panel" aria-labelledby="input-title">
+        <div class="panel-heading"><h2 id="input-title">Input</h2><button id="clear" class="quiet" type="button">Clear</button></div>
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Choose or drop an image or audio file">
+          <strong>Drop an image or audio file</strong><span>PNG, JPEG, WebP, WAV or MP3</span>
+        </div>
+        <div class="upload-actions"><button id="choose" class="secondary" type="button">Choose file</button><button id="paste" class="secondary" type="button">Paste image</button><span>or press Ctrl / Cmd + V</span></div>
+        <input id="file" type="file" accept="image/png,image/jpeg,image/webp,audio/wav,audio/x-wav,audio/mpeg,.wav,.mp3" hidden>
+        <details class="resize-limits"><summary>Resize limits</summary>
+          <div class="limit-fields"><label>Min short edge<input id="min-short-edge" type="number" min="16" step="16"></label><label>Max long edge<input id="max-long-edge" type="number" min="16" step="16"></label><button id="apply-limits" class="secondary" type="button">Apply and fit</button></div>
+          <p class="hint">Fit the image using these limits. Cropping keeps the selected pixels.</p>
+        </details>
+        <div id="media-info" class="media-info" hidden><span id="file-name"></span><span id="source-size"></span></div>
+        <fieldset id="editor" class="editor" hidden>
+          <div class="preview-toolbar">
+            <button id="crop-mode" class="secondary small" type="button">Crop</button><button id="cancel-crop" class="quiet" type="button" hidden>Cancel crop</button><button id="reset-crop" class="quiet" type="button">Reset crop</button>
+            <label class="check"><input id="show-grid" type="checkbox">Patch grid</label><button id="zoom" class="quiet" type="button">Zoom 2x</button>
+          </div>
+          <div id="viewport" class="canvas-stage"><canvas id="crop-canvas" tabindex="0" aria-label="Image preview. Choose Crop to select an area, then apply it."></canvas></div>
+          <div class="preview-caption"><span id="preview-size"></span><span id="model-size"></span></div>
+          <p id="edit-hint" class="hint">This preview is the image sent for encoding.</p>
+          <details class="crop-details"><summary>Crop in resized pixels <span id="crop-size"></span></summary><div class="coordinate-fields">
+            <label>X<input id="crop-x" type="number" min="0" step="1"></label><label>Y<input id="crop-y" type="number" min="0" step="1"></label><label>Width<input id="crop-width" type="number" min="16" step="16"></label><label>Height<input id="crop-height" type="number" min="16" step="16"></label>
+          </div></details>
+          <div class="resize-heading"><h3>Resize image</h3><button id="fit" class="quiet" type="button">Reset size</button></div>
+          <div class="resize-fields"><label>Width<input id="width" type="number" min="16" max="{{max_long_edge}}" step="1"></label><span class="times" aria-hidden="true">&times;</span><label>Height<input id="height" type="number" min="16" max="{{max_long_edge}}" step="1"></label><label class="check"><input id="lock-ratio" type="checkbox" checked>Lock ratio</label></div>
+          <label class="scale-label" for="scale">Long edge <output id="scale-value"></output></label><input id="scale" type="range" min="16" max="{{max_long_edge}}" value="{{min_short_edge}}" step="1">
+        </fieldset>
+        <div id="audio-preview" class="audio-preview" hidden><audio id="audio" controls preload="metadata"></audio><p class="hint">Audio is encoded from the original file. MP3 requires FFmpeg on the server.</p></div>
+        <details class="connection">
+          <summary>API key</summary>
+          <label for="api-key">Only if required by the server</label>
+          <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer key">
+        </details>
+        <div class="run-row"><button id="encode" class="primary" type="button" disabled>Encode</button><button id="cancel" class="secondary" type="button" hidden>Cancel</button></div>
+        <p class="privacy">Nothing is saved by this app. Clear or close the page to discard the session.</p>
+      </section>
+      <section class="panel result-panel" aria-labelledby="result-title">
+        <div class="panel-heading"><h2 id="result-title">Token string</h2><button id="copy" class="secondary small" type="button" disabled>Copy</button></div>
+        <div class="result-options"><label class="check"><input id="auto-copy" type="checkbox" checked>Auto-copy result</label><label class="check"><input id="escape-newlines" type="checkbox" checked>Escape newlines (\n)</label><span id="token-count">No result yet</span></div>
+        <label class="sr-only" for="result">Encoded token string</label><textarea id="result" readonly spellcheck="false" autocomplete="off" placeholder="No result"></textarea>
+        <div class="timing"><div><span>Inference</span><strong id="inference-time" title="Server encoding time, including preprocessing, queueing, and first-use model loading. Excludes upload.">--</strong></div><div><span>Round trip</span><strong id="request-time">--</strong></div></div>
+        <p id="status" class="status" role="status" aria-live="polite">Select a file to encode.</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

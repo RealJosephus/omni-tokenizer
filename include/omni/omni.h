@@ -71,6 +71,8 @@ OMNI_API int omni_encode_audio(omni_context *context, const float *mel, uint32_t
                                uint32_t valid_frames, uint16_t *codes, size_t capacity,
                                size_t *count);
 /* pixels is contiguous RGB CHW, preprocessed to [-1,1]. H/W are patch multiples.
+ * No resize policy is imposed here. Dimensions are checked for tensor/BLAS
+ * index overflow before reading pixels; allocations can return OUT_OF_MEMORY.
  * The code grid has (height/patch_size,width/patch_size), in row-major order. */
 OMNI_API int omni_encode_image(omni_context *context, const float *pixels, uint32_t height,
                                uint32_t width, uint16_t *codes, size_t capacity, size_t *count);

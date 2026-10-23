@@ -12,8 +12,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 
+from .image import DEFAULT_MAX_PIXELS, ImageOptions, validate_image_options
 from .protocol import (
     BINARY_MEDIA_TYPE,
     STREAM_MEDIA_TYPE,
@@ -38,6 +40,46 @@ class RequestError(ValueError):
     def __init__(self, message, status=400, code="invalid_request"):
         super().__init__(message)
         self.status, self.code = status, code
+
+
+def _image_options(value):
+    try:
+        return validate_image_options(value)
+    except ValueError as exc:
+        raise RequestError(str(exc)) from exc
+
+
+class _ResponseHeaders:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    (key, value)
+                    for key, value in message.get("headers", [])
+                    if key.lower() != b"cache-control"
+                ]
+                headers.extend(
+                    [
+                        (b"cache-control", b"no-store"),
+                        (b"x-content-type-options", b"nosniff"),
+                        (b"referrer-policy", b"no-referrer"),
+                        (
+                            b"content-security-policy",
+                            (
+                                b"default-src 'none'; script-src 'self'; style-src 'self'; "
+                                b"img-src 'self' blob: data:; media-src blob:; connect-src 'self'; "
+                                b"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                            ),
+                        ),
+                    ]
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
 
 
 def _b64(value, limit):
@@ -73,6 +115,7 @@ def validate_manifest(value, limits):
             "part",
             "data",
             "format",
+            "image_options",
         }:
             raise RequestError("Unknown item fields")
         item_id = item.get("item_id")
@@ -88,6 +131,10 @@ def validate_manifest(value, limits):
         seen.add(item_id)
         if item.get("type") not in {"audio", "image"}:
             raise RequestError("Item type must be audio or image")
+        if "image_options" in item:
+            if item["type"] != "image":
+                raise RequestError("image_options requires an image item")
+            _image_options(item["image_options"])
         if ("part" in item) == ("data" in item):
             raise RequestError(
                 "Each item must name one multipart part or supply base64 data"
@@ -114,9 +161,11 @@ def validate_manifest(value, limits):
 
 
 def parse_chat(value):
-    allowed = {"model", "messages", "stream"}
+    allowed = {"model", "messages", "stream", "image_options"}
     if not isinstance(value, dict) or set(value) - allowed:
-        raise RequestError("Supported chat fields are model, messages, and stream")
+        raise RequestError(
+            "Supported chat fields are model, messages, stream, and image_options"
+        )
     if type(value.get("stream", False)) is not bool or (
         "model" in value and value["model"] != "omni-tokenizer"
     ):
@@ -151,10 +200,16 @@ def parse_chat(value):
             raise RequestError("Invalid image_url")
         if image.get("detail", "auto") != "auto":
             raise RequestError("Only image_url.detail=auto is supported")
-        return {"item_id": "0", "type": "image", "url": image["url"]}, value.get(
-            "stream", False
-        )
+        options = _image_options(value.get("image_options", {}))
+        return {
+            "item_id": "0",
+            "type": "image",
+            "url": image["url"],
+            "image_options": options,
+        }, value.get("stream", False)
     if kind == "input_audio":
+        if "image_options" in value:
+            raise RequestError("image_options requires an image item")
         audio = media.get("input_audio")
         if (
             set(media) != {"type", "input_audio"}
@@ -205,6 +260,51 @@ async def _json_request(request, limit):
         return json.loads(body)
     except (ValueError, UnicodeError) as exc:
         raise RequestError("Invalid JSON") from exc
+
+
+async def _webui_input(request, limits):
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    kinds = {
+        "image/png": "image",
+        "image/jpeg": "image",
+        "image/webp": "image",
+        "audio/wav": "audio",
+        "audio/x-wav": "audio",
+        "audio/mpeg": "audio",
+    }
+    if content_type not in kinds:
+        raise RequestError("Use PNG, JPEG, WebP, PCM WAV, or MP3", 415)
+    params = request.query_params
+    if set(params) - {"min_short_edge", "max_long_edge"} or any(
+        len(params.getlist(key)) != 1 for key in params
+    ):
+        raise RequestError(
+            "Expected unique min_short_edge and max_long_edge query parameters"
+        )
+    if params and kinds[content_type] != "image":
+        raise RequestError("Image resize parameters require an image")
+    try:
+        values = {key: int(value) for key, value in params.items()}
+    except ValueError as exc:
+        raise RequestError("Image resize parameters must be integers") from exc
+    options = _image_options(values)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limits.max_json_bytes:
+            raise RequestError(
+                "Media exceeds the WebUI upload limit", 413, "input_limit"
+            )
+        body.extend(chunk)
+    if not body:
+        raise RequestError("Media is empty")
+    return [
+        {
+            "item_id": "0",
+            "type": kinds[content_type],
+            "source": bytes(body),
+            "image_options": options,
+        }
+    ], False
 
 
 async def _inputs(request, directory, limits, *, chat=False):
@@ -270,6 +370,8 @@ async def _inputs(request, directory, limits, *, chat=False):
     inputs = []
     for index, item in enumerate(value["items"]):
         prepared = {"item_id": item["item_id"], "type": item["type"]}
+        if "image_options" in item:
+            prepared["image_options"] = item["image_options"]
         try:
             if "part" in item:
                 if item["part"] not in parts:
@@ -301,7 +403,7 @@ async def _inputs(request, directory, limits, *, chat=False):
     return inputs, value.get("stream", False)
 
 
-def _aggregate(engine, inputs, cancel, limit):
+def _aggregate(engine, inputs, cancel, limit, *, resize_images=True):
     results = []
     total_codes = 0
     for item in inputs:
@@ -316,7 +418,10 @@ def _aggregate(engine, inputs, cancel, limit):
                     if item["type"] == "image"
                     else engine.encode_audio
                 )
-                output = fn(item["source"], cancel=cancel)
+                options = dict(item.get("image_options", {}))
+                if item["type"] == "image" and not resize_images:
+                    options["resize"] = False
+                output = fn(item["source"], cancel=cancel, **options)
                 total_codes += len(output["codes"])
                 if total_codes > limit:
                     raise RequestError(
@@ -354,7 +459,15 @@ def _frames(engine, inputs, cancel):
             iterator = (
                 engine.iter_audio(item["source"], cancel=cancel)
                 if item["type"] == "audio"
-                else iter([engine.encode_image(item["source"], cancel=cancel)])
+                else iter(
+                    [
+                        engine.encode_image(
+                            item["source"],
+                            cancel=cancel,
+                            **item.get("image_options", {}),
+                        )
+                    ]
+                )
             )
             for output in iterator:
                 cancel.check()
@@ -385,15 +498,41 @@ def _frames(engine, inputs, cancel):
 def create_app(engine, *, limits=None, api_key=None):
     """Create an ASGI app. Keep one worker process per device/model set."""
     from starlette.applications import Starlette
+    from starlette.middleware import Middleware
     from starlette.requests import ClientDisconnect
     from starlette.responses import JSONResponse, Response, StreamingResponse
     from starlette.routing import Route
 
     limits = limits or Limits()
+    image_defaults = getattr(engine, "image_options", ImageOptions())
+    max_image_pixels = getattr(engine, "max_image_pixels", DEFAULT_MAX_PIXELS)
     active = 0
 
     async def health(_):
         return JSONResponse({"status": "ok", "version": 1, "active_requests": active})
+
+    async def webui(request):
+        name = request.path_params.get("asset", "index.html")
+        types = {
+            "index.html": "text/html",
+            "app.js": "text/javascript",
+            "style.css": "text/css",
+        }
+        if name not in types:
+            return Response(status_code=404)
+        content = files("omni_tokenizer").joinpath("web", name).read_bytes()
+        if name == "index.html":
+            settings = {
+                "upload_limit": limits.max_json_bytes,
+                "min_short_edge": image_defaults.min_short_edge,
+                "max_long_edge": image_defaults.max_long_edge,
+                "max_image_pixels": max_image_pixels,
+            }
+            for key, value in settings.items():
+                content = content.replace(
+                    ("{{" + key + "}}").encode("ascii"), str(value).encode("ascii")
+                )
+        return Response(content, media_type=types[name])
 
     async def endpoint(request):
         nonlocal active
@@ -408,14 +547,18 @@ def create_app(engine, *, limits=None, api_key=None):
                 headers={"Retry-After": "1"},
             )
         active += 1
-        directory = tempfile.TemporaryDirectory(prefix="omni-tokenizer-")
+        ui = request.url.path == "/ui/encode"
+        directory = None
+        inputs = []
         cancel = Cancellation()
         released = False
 
         def release():
             nonlocal active, released
             if not released:
-                directory.cleanup()
+                if directory is not None:
+                    directory.cleanup()
+                inputs.clear()
                 active -= 1
                 released = True
 
@@ -423,9 +566,13 @@ def create_app(engine, *, limits=None, api_key=None):
         handed_off = False
         job = None
         try:
-            inputs, stream = await _inputs(
-                request, Path(directory.name), limits, chat=chat
-            )
+            if ui:
+                inputs, stream = await _webui_input(request, limits)
+            else:
+                directory = tempfile.TemporaryDirectory(prefix="omni-tokenizer-")
+                inputs, stream = await _inputs(
+                    request, Path(directory.name), limits, chat=chat
+                )
             if stream:
                 request_id = "chatcmpl-" + uuid.uuid4().hex
                 created = int(time.time())
@@ -525,14 +672,37 @@ def create_app(engine, *, limits=None, api_key=None):
                     media_type="text/event-stream" if chat else STREAM_MEDIA_TYPE,
                     headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
                 )
-            job = asyncio.create_task(
-                asyncio.to_thread(_aggregate, engine, inputs, cancel, limits.max_codes)
-            )
+
+            def encode():
+                started = time.perf_counter()
+                results = _aggregate(
+                    engine, inputs, cancel, limits.max_codes, resize_images=not ui
+                )
+                return results, (time.perf_counter() - started) * 1000
+
+            job = asyncio.create_task(asyncio.to_thread(encode))
             while not job.done():
                 await asyncio.wait({job}, timeout=0.1)
                 if await request.is_disconnected():
                     cancel.cancel()
-            results = await job
+            results, inference_ms = await job
+            if ui:
+                result = results[0]
+                if result["status"] != "ok":
+                    return JSONResponse({"error": result["error"]}, 422)
+                return JSONResponse(
+                    {
+                        "text": token_text(
+                            result["codes"], result["type"], result.get("shape")
+                        ),
+                        "type": result["type"],
+                        "shape": result.get("shape"),
+                        "code_count": len(result["codes"]),
+                        "inference_ms": inference_ms,
+                        "image_options": result.get("image_options"),
+                    },
+                    headers={"Server-Timing": f"inference;dur={inference_ms:.3f}"},
+                )
             if chat:
                 result = results[0]
                 if result["status"] != "ok":
@@ -580,9 +750,13 @@ def create_app(engine, *, limits=None, api_key=None):
                     release()
 
     return Starlette(
+        middleware=[Middleware(_ResponseHeaders)],
         routes=[
+            Route("/", webui),
+            Route("/ui/encode", endpoint, methods=["POST"]),
+            Route("/ui/{asset}", webui),
             Route("/health", health),
             Route("/v1/tokenize", endpoint, methods=["POST"]),
             Route("/v1/chat/completions", endpoint, methods=["POST"]),
-        ]
+        ],
     )
