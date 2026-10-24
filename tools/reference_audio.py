@@ -2,8 +2,9 @@
 
 This offline tool requires torch, safetensors, transformers, torchaudio, and
 a separate checkout of GLM-4-Voice. It never downloads or publishes weights.
-The reference uses the original model code with explicit eager FP32 attention
-and the installed Transformers extractor; versions are written into results.
+The reference keeps upstream loading and attention defaults. Explicit attention
+and TF32 overrides are diagnostic options, recorded in the results. Synthetic
+fixtures test boundaries; use validate_audio.py for real-speech comparisons.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from safetensors.torch import load_file
 from transformers import WhisperFeatureExtractor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -41,32 +41,46 @@ def signal(length: int) -> np.ndarray:
 
 
 class AudioReference:
-    def __init__(self, checkpoint: Path, reference_root: Path, device: str = "cuda"):
+    def __init__(
+        self,
+        checkpoint: Path,
+        reference_root: Path,
+        device: str = "cuda",
+        attention: str = "default",
+    ):
         sys.path.insert(0, str(reference_root))
-        from speech_tokenizer.configuration_whisper import WhisperVQConfig
         from speech_tokenizer.modeling_whisper import WhisperVQEncoder
 
         self.device = torch.device(device)
-        configuration = WhisperVQConfig.from_pretrained(str(checkpoint))
-        configuration.quantize_encoder_only = True
-        configuration._attn_implementation = "eager"
-        with torch.device("meta"):
-            self.model = WhisperVQEncoder(configuration)
-        weights = load_file(str(checkpoint / "model.safetensors"), device="cpu")
-        if any(key.startswith("model.encoder.") for key in weights):
-            weights = {
-                key.removeprefix("model.encoder."): value
-                for key, value in weights.items()
-                if key.startswith("model.encoder.")
-            }
-        self.model.load_state_dict(weights, strict=True, assign=True)
-        del weights
-        self.model.eval().to(self.device)
-        self.last_pooled = None
+        options = {} if attention == "default" else {"attn_implementation": attention}
+        self.model = (
+            WhisperVQEncoder.from_pretrained(
+                str(checkpoint), local_files_only=True, **options
+            )
+            .eval()
+            .to(self.device)
+        )
+        self._last_pooled = None
         self.model.pooling_layer.register_forward_hook(self._pool_hook)
 
     def _pool_hook(self, module, inputs, output):
-        self.last_pooled = output.detach().transpose(1, 2).cpu().numpy().copy()
+        self._last_pooled = output.detach().transpose(1, 2)
+
+    @property
+    def last_pooled(self):
+        """Copy diagnostic features only when requested, outside timed inference."""
+        if self._last_pooled is None:
+            return None
+        return self._last_pooled.cpu().numpy().copy()
+
+    def execution_settings(self):
+        return {
+            "attention": self.model.config._attn_implementation,
+            "attention_class": type(self.model.layers[0].self_attn).__name__,
+            "dtype": str(next(self.model.parameters()).dtype),
+            "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        }
 
     @torch.inference_mode()
     def encode(self, mel: np.ndarray, valid_frames: int | list[int]) -> np.ndarray:
@@ -78,7 +92,9 @@ class AudioReference:
             < torch.tensor(counts, device=self.device)[:, None]
         )
         outputs = self.model(
-            input_features=torch.from_numpy(mel).to(self.device),
+            input_features=torch.from_numpy(mel).to(
+                self.device, dtype=self.model.conv1.weight.dtype
+            ),
             attention_mask=mask.long(),
         )
         return outputs.quantized_token_ids.cpu().numpy().astype(np.uint16)
@@ -90,6 +106,10 @@ def main():
     parser.add_argument("--reference-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
+    parser.add_argument(
+        "--attention", default="default", choices=("default", "eager", "sdpa")
+    )
+    parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--skip-full", action="store_true")
     parser.add_argument("--lengths", nargs="+", type=int)
     parser.add_argument("--skip-padding-probes", action="store_true")
@@ -99,16 +119,20 @@ def main():
         parser.error("--lengths must be between 1 and 480000 samples")
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    reference = AudioReference(args.checkpoint, args.reference_root, args.device)
+    if args.disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    reference = AudioReference(
+        args.checkpoint, args.reference_root, args.device, args.attention
+    )
     extractor = WhisperFeatureExtractor.from_pretrained(str(args.checkpoint))
     report = {
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "platform": platform.platform(),
         "device": args.device,
-        "attention": "original-glm-eager-fp32-tf32-off",
+        "execution": reference.execution_settings(),
+        "input_kind": "synthetic boundary fixtures; not a speech quality evaluation",
         "checkpoint_sha256": sha256(args.checkpoint / "model.safetensors"),
         "reference_source_sha256": sha256(
             args.reference_root / "speech_tokenizer" / "modeling_whisper.py"

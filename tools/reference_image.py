@@ -1,19 +1,21 @@
-"""Generate image baselines from X-Omni equations.
+"""Validate native image encoding against unmodified X-Omni on supplied images.
 
-This is an offline validation tool. PyTorch SDPA replaces the external
-flash_attn dependency; results are labelled with that substitution and are not
-claimed bit-exact to a particular release of FlashAttention.
+The reference imports X-Omni's tokenizer and its external FlashAttention path.
+PyTorch, timm, einops, torchvision and flash-attn are offline validation
+dependencies; they are not runtime dependencies of omni-tokenizer.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
-import platform
 import statistics
 import sys
 import time
+import types
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -23,309 +25,199 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from omni_tokenizer.image import prepare_image
+from omni_tokenizer.native import Library, Model
 
 
 def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
-        return digest.hexdigest()
+    return digest.hexdigest()
 
 
 class ImageReference:
-    """Encoding-only functional translation of X-Omni's VQSigLIP graph."""
+    """Load the upstream implementation without changing its operators or flags."""
 
-    def __init__(
-        self,
-        checkpoint: Path,
-        device: str = "cuda",
-        dtype: str = "bf16",
-        trace_directory: Path | None = None,
-        attention: str = "math",
-    ):
+    def __init__(self, checkpoint: Path, x_omni: Path, device: str = "cuda"):
+        source = x_omni.resolve()
+        for name in ("modeling_siglip_tokenizer.py", "modeling_vit.py"):
+            if not (source / name).is_file():
+                raise ValueError(f"X-Omni source file is missing: {source / name}")
+        # Give the two upstream modules a package for their relative import,
+        # without executing unrelated language-model package initialization.
+        package_name = (
+            "_omni_reference_" + hashlib.sha256(str(source).encode()).hexdigest()[:12]
+        )
+        if package_name not in sys.modules:
+            package = types.ModuleType(package_name)
+            package.__path__ = [str(source)]
+            sys.modules[package_name] = package
+        upstream = importlib.import_module(package_name + ".modeling_siglip_tokenizer")
         self.device = torch.device(device)
-        self.dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
-        if attention not in ("math", "flash"):
-            raise ValueError("attention must be 'math' or 'flash'")
-        if attention == "flash" and (
-            self.device.type != "cuda"
-            or self.dtype != torch.bfloat16
-            or not torch.backends.cuda.is_flash_attention_available()
-        ):
-            raise ValueError(
-                "FlashAttention requires a supported CUDA PyTorch build and BF16 inputs"
+        if self.device.type != "cuda":
+            raise ValueError("The original BF16 FlashAttention reference requires CUDA")
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            self.model = upstream.SiglipTokenizer(
+                "siglip2_giant_patch16_384",
+                str(checkpoint / "vit_g.pth"),
+                str(checkpoint / "siglip_vq.pt"),
             )
-        self.attention = "torch-sdpa-" + attention
-        self.weights = {}
-        for filename in ("vit_g.pth", "siglip_vq.pt"):
-            tensors = torch.load(
-                checkpoint / filename, map_location="cpu", weights_only=True, mmap=True
-            )
-            for name, value in tensors.items():
-                if name == "pos_embed" or name.startswith(
-                    ("patch_embed.", "blocks.", "quant_conv.", "quantize.embedding.")
-                ):
-                    self.weights[name] = value.to(device=self.device, dtype=self.dtype)
-        self.last_features = None
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        self.model = self.model.eval().to(self.device, torch.bfloat16)
+        self.preprocess = upstream.create_anyres_preprocess()
         self.last_projected = None
-        self.last_normalized = None
-        self.trace_directory = trace_directory
-        self.convolution_probe = {}
-        if trace_directory:
-            trace_directory.mkdir(parents=True, exist_ok=True)
+        self.model.vqproj.quantize.register_forward_pre_hook(self._capture_projection)
+        self.sources = {
+            name: sha256(source / name)
+            for name in ("modeling_siglip_tokenizer.py", "modeling_vit.py")
+        }
 
-    def trace(self, name, value):
-        if self.trace_directory:
-            np.save(self.trace_directory / (name + ".npy"), value.float().cpu().numpy())
-
-    def probe_convolution(self, name, inputs, convolution, weight, bias):
-        if self.trace_directory:
-            matrix = inputs.reshape(-1, inputs.shape[-1]).contiguous()
-            fused = F.linear(matrix, weight.flatten(1), bias).reshape(convolution.shape)
-            split = (F.linear(matrix, weight.flatten(1)) + bias).reshape(
-                convolution.shape
-            )
-            self.convolution_probe[name] = {
-                "fused_differences": int((convolution != fused).sum()),
-                "fused_max_abs": float((convolution - fused).abs().max()),
-                "split_differences": int((convolution != split).sum()),
-                "split_max_abs": float((convolution - split).abs().max()),
-                "elements": convolution.numel(),
-            }
-
-    def linear(self, x, prefix):
-        return F.linear(
-            x, self.weights[prefix + ".weight"], self.weights[prefix + ".bias"]
-        )
-
-    def norm(self, x, prefix):
-        return F.layer_norm(
-            x,
-            (1536,),
-            self.weights[prefix + ".weight"],
-            self.weights[prefix + ".bias"],
-            eps=1e-6,
-        )
+    def _capture_projection(self, module, args):
+        self.last_projected = args[0]
 
     @torch.inference_mode()
     def encode(self, pixels: np.ndarray) -> np.ndarray:
-        x = torch.from_numpy(pixels).unsqueeze(0).to(self.device, self.dtype)
-        h, w = x.shape[-2] // 16, x.shape[-1] // 16
-        source = x
-        x = (
-            F.conv2d(
-                x,
-                self.weights["patch_embed.proj.weight"],
-                self.weights["patch_embed.proj.bias"],
-                stride=16,
-            )
-            .flatten(2)
-            .transpose(1, 2)
-        )
-        if self.trace_directory:
-            patches = F.unfold(source, kernel_size=16, stride=16).transpose(1, 2)
-            self.probe_convolution(
-                "patch",
-                patches,
-                x,
-                self.weights["patch_embed.proj.weight"],
-                self.weights["patch_embed.proj.bias"],
-            )
-        self.trace("patch", x)
-        pos = self.weights["pos_embed"]
-        pos = pos[0].T.contiguous().view(1, -1, 128, 128)
-        pos = F.interpolate(pos, (h, w), mode="bilinear", align_corners=False)
-        pos = pos.view(-1, h * w).T.contiguous().unsqueeze(0)
-        self.trace("position", pos)
-        x = x + pos
-        self.trace("input", x)
-        backend = (
-            torch.nn.attention.SDPBackend.FLASH_ATTENTION
-            if self.attention == "torch-sdpa-flash"
-            else torch.nn.attention.SDPBackend.MATH
-        )
-        with torch.nn.attention.sdpa_kernel(backend):
-            for index in range(40):
-                prefix = f"blocks.{index}"
-                normalized = self.norm(x, prefix + ".norm1")
-                if index == 0:
-                    self.trace("layer0_norm1", normalized)
-                qkv = self.linear(normalized, prefix + ".attn.qkv")
-                if index == 0:
-                    self.trace("layer0_qkv", qkv)
-                q, k, v = qkv.view(1, h * w, 3, 16, 96).permute(2, 0, 3, 1, 4).unbind(0)
-                attended = (
-                    F.scaled_dot_product_attention(
-                        q, k, v, dropout_p=0.0, is_causal=False, scale=96**-0.5
-                    )
-                    .transpose(1, 2)
-                    .reshape(1, h * w, 1536)
-                )
-                if index == 0:
-                    self.trace("layer0_attention", attended)
-                x = x + self.linear(attended, prefix + ".attn.proj")
-                if index == 0:
-                    self.trace("layer0_residual1", x)
-                hidden = self.linear(
-                    self.norm(x, prefix + ".norm2"), prefix + ".mlp.fc1"
-                )
-                if index == 0:
-                    self.trace("layer0_fc1", hidden)
-                hidden = F.gelu(hidden, approximate="none")
-                if index == 0:
-                    self.trace("layer0_gelu", hidden)
-                x = x + self.linear(hidden, prefix + ".mlp.fc2")
-                self.trace(f"layer{index}", x)
-        self.last_features = x
-        projected = (
-            F.conv2d(
-                x.reshape(1, h, w, 1536).permute(0, 3, 1, 2),
-                self.weights["quant_conv.weight"],
-                self.weights["quant_conv.bias"],
-            )
-            .permute(0, 2, 3, 1)
-            .contiguous()
-            .view(-1, 2048)
-        )
-        self.probe_convolution(
-            "projection",
-            x.view(-1, 1536),
-            projected,
-            self.weights["quant_conv.weight"],
-            self.weights["quant_conv.bias"],
-        )
-        self.trace("projected", projected)
-        self.last_projected = projected
-        z = F.normalize(projected, p=2, dim=-1)
-        self.last_normalized = z
-        self.trace("normalized", z)
-        embedding = F.normalize(self.weights["quantize.embedding.weight"], p=2, dim=-1)
-        distance = torch.sum(z**2, dim=1, keepdim=True) + torch.sum(embedding**2, dim=1)
-        distance = distance - 2 * torch.einsum("bd,dn->bn", z, embedding.T)
-        return distance.argmin(dim=1).reshape(h, w).to("cpu").numpy().astype(np.uint16)
+        tensor = torch.from_numpy(pixels).unsqueeze(0).to(self.device, torch.bfloat16)
+        return self.model.encode(tensor).cpu().numpy().astype(np.uint16).ravel()
 
-
-def synthetic_image(width: int, height: int) -> Image.Image:
-    """Create a deterministic spatial/color pattern without external media."""
-    y, x = np.indices((height, width), dtype=np.uint32)
-    values = np.stack(
-        (
-            (x * 7 + y * 3) % 256,
-            (x // 11 * 37 + y // 17 * 23) % 256,
-            ((x ^ y) * 5 + x * y % 127) % 256,
-        ),
-        axis=-1,
-    ).astype(np.uint8)
-    return Image.fromarray(values)
+    @torch.inference_mode()
+    def normalized_features(self) -> np.ndarray:
+        if self.last_projected is None:
+            raise RuntimeError("Encode an image before requesting features")
+        z = self.last_projected.permute(0, 2, 3, 1).contiguous()
+        z = z.reshape(-1, z.shape[-1])
+        return F.normalize(z, p=2, dim=-1).float().cpu().numpy()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--x-omni", type=Path, required=True, help="Unmodified X-Omni source checkout"
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("build/validation/image"))
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
-    parser.add_argument(
-        "--attention",
-        choices=("math", "flash"),
-        default="math",
-        help="Select the attention reference explicitly; math is the native comparison profile",
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
+        "--images", type=Path, nargs="+", help="Real image files to validate"
     )
-    parser.add_argument(
-        "--sizes", nargs="+", default=["384x384", "576x384", "1152x1152"]
-    )
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument(
-        "--trace",
+    inputs.add_argument(
+        "--manifest",
         type=Path,
-        help="Save intermediate tensors and compare convolution/GEMM bias rounding",
+        help="JSON with images entries containing relative file paths",
+    )
+    parser.add_argument(
+        "--limit", type=int, help="Validate only the first N supplied images"
+    )
+    parser.add_argument("--native-library", type=Path)
+    parser.add_argument("--native-model", type=Path)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument(
+        "--output", type=Path, default=Path("build/validation/image-fa2/report.json")
     )
     args = parser.parse_args()
-    if args.repeat < 1:
-        parser.error("--repeat must be positive")
-    args.output.mkdir(parents=True, exist_ok=True)
-    torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    started = time.perf_counter()
-    reference = ImageReference(
-        args.checkpoint, args.device, args.dtype, args.trace, args.attention
-    )
-    if reference.device.type == "cuda":
-        torch.cuda.synchronize()
+    if args.repeat < 1 or (args.limit is not None and args.limit < 1):
+        parser.error("--repeat and --limit must be positive")
+    if bool(args.native_library) != bool(args.native_model):
+        parser.error("--native-library and --native-model must be specified together")
+    if args.manifest:
+        entries = json.loads(args.manifest.read_text(encoding="utf-8"))["images"]
+        paths = [args.manifest.parent / item["file"] for item in entries]
+    else:
+        paths = args.images
+    if args.limit:
+        paths = paths[: args.limit]
+    if not paths:
+        parser.error("The image set is empty")
+    reference = ImageReference(args.checkpoint, args.x_omni, args.device)
     report = {
-        "profile": f"reference-{args.dtype}-{reference.attention}",
-        "torch": torch.__version__,
-        "platform": platform.platform(),
-        "device": str(reference.device),
-        "device_name": torch.cuda.get_device_name()
-        if reference.device.type == "cuda"
-        else platform.processor(),
-        "load_seconds": time.perf_counter() - started,
-        "attention_substitution": "PyTorch SDPA replaces external flash_attn_func; cross-library bit equality is unverified",
-        "tracing_enabled": bool(args.trace),
-        "sources": {
-            name: sha256(args.checkpoint / name)
-            for name in ("vit_g.pth", "siglip_vq.pt")
-        },
-        "cases": [],
+        "reference": "Unmodified X-Omni BF16 with external FlashAttention",
+        "source_sha256": reference.sources,
+        "timing": "Prepared CPU FP32 pixels to CPU uint16 codes; excludes preprocessing, loading and feature comparison.",
+        "images": [],
     }
-    for size in args.sizes:
-        width, height = map(int, size.split("x"))
-        source = args.output / f"pattern-{size}.png"
-        synthetic_image(width, height).save(source)
-        prepared = prepare_image(source)
-        if reference.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
-        started = time.perf_counter()
-        codes = reference.encode(prepared.pixels)
-        if reference.device.type == "cuda":
-            torch.cuda.synchronize()
-        first_seconds = time.perf_counter() - started
-        timings = []
-        repeat_flips = []
-        for _ in range(args.repeat):
-            started = time.perf_counter()
-            repeated = reference.encode(prepared.pixels)
-            if reference.device.type == "cuda":
-                torch.cuda.synchronize()
-            timings.append(time.perf_counter() - started)
-            repeat_flips.append(int(np.count_nonzero(codes != repeated)))
-        np.savez(
-            args.output / f"pattern-{size}-{args.dtype}.npz",
-            pixels=prepared.pixels,
-            codes=codes,
-            features=reference.last_features.float().cpu().numpy(),
-            projected=reference.last_projected.float().cpu().numpy(),
-            normalized=reference.last_normalized.float().cpu().numpy(),
-        )
-        case = {
-            "input": source.name,
-            "input_sha256": sha256(source),
-            "original_size": prepared.original_size,
-            "processed_size": prepared.processed_size,
-            "grid": prepared.grid,
-            "count": int(codes.size),
-            "codes_sha256": hashlib.sha256(codes.astype("<u2").tobytes()).hexdigest(),
-            "first_seconds": first_seconds,
-            "steady_seconds": timings,
-            "median_seconds": statistics.median(timings),
-            "repeat_code_flips": repeat_flips,
-        }
-        if reference.device.type == "cuda":
-            case.update(
-                peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),
-                peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(),
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        context = None
+        if args.native_library:
+            native = stack.enter_context(
+                Model(Library(args.native_library), args.native_model, args.device)
             )
-        report["cases"].append(case)
-        if args.trace:
-            report["convolution_probe"] = reference.convolution_probe
-        (args.output / f"report-{args.dtype}.json").write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
-        )
-        print(json.dumps(case), flush=True)
+            context = stack.enter_context(native.context())
+        for index, path in enumerate(paths):
+            with Image.open(path) as image:
+                pixels = reference.preprocess(image)
+            if pixels is None:
+                raise ValueError(
+                    f"Image is rejected by X-Omni's preprocessing filter: {path}"
+                )
+            prepared = prepare_image(path)
+            np.testing.assert_array_equal(pixels.numpy(), prepared.pixels)
+            expected = reference.encode(prepared.pixels)
+            target = reference.normalized_features()
+            record = {
+                "input": path.name,
+                "input_sha256": sha256(path),
+                "shape": list(prepared.pixels.shape[-2:]),
+                "codes": int(expected.size),
+                "reference_codes_sha256": hashlib.sha256(
+                    expected.astype("<u2").tobytes()
+                ).hexdigest(),
+            }
+            if context:
+                actual = context.encode_image(prepared.pixels)
+                features = context.features(len(actual))
+                if not np.isfinite(features).all():
+                    raise ValueError(f"Native features are non-finite: {path}")
+                delta = features.astype(np.float64) - target
+                record.update(
+                    changed_codes=int(np.count_nonzero(actual != expected)),
+                    changed_features=int(np.count_nonzero(delta)),
+                    max_abs=float(np.abs(delta).max()),
+                    rms=float(np.sqrt(np.mean(delta * delta))),
+                )
+            # Correctness runs above warm the shape before paired timing.
+            times = {"reference": [], **({"native": []} if context else {})}
+            calls = {"reference": reference.encode}
+            if context:
+                calls["native"] = context.encode_image
+            for repeat in range(args.repeat):
+                order = list(calls)
+                if repeat % 2:
+                    order.reverse()
+                for name in order:
+                    started = time.perf_counter()
+                    repeated = calls[name](prepared.pixels)
+                    times[name].append(time.perf_counter() - started)
+                    first = expected if name == "reference" else actual
+                    if not np.array_equal(repeated, first):
+                        raise RuntimeError(f"{name} output is not repeatable: {path}")
+            record["median_seconds"] = {
+                name: statistics.median(values) for name, values in times.items()
+            }
+            report["images"].append(record)
+            if (index + 1) % 50 == 0 or index + 1 == len(paths):
+                report["total_codes"] = sum(item["codes"] for item in report["images"])
+                if context:
+                    report["changed_codes"] = sum(
+                        item["changed_codes"] for item in report["images"]
+                    )
+                    report["changed_feature_images"] = sum(
+                        item["changed_features"] > 0 for item in report["images"]
+                    )
+                report["complete"] = index + 1 == len(paths)
+                args.output.write_text(
+                    json.dumps(report, indent=2) + "\n", encoding="utf-8"
+                )
+                print(
+                    json.dumps(
+                        {key: value for key, value in report.items() if key != "images"}
+                    ),
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
