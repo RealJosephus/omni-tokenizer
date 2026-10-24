@@ -73,7 +73,9 @@ OMNI_API int omni_encode_audio(omni_context *context, const float *mel, uint32_t
 /* pixels is contiguous RGB CHW, preprocessed to [-1,1]. H/W are patch multiples.
  * No resize policy is imposed here. Dimensions are checked for tensor/BLAS
  * index overflow before reading pixels; allocations can return OUT_OF_MEMORY.
- * The code grid has (height/patch_size,width/patch_size), in row-major order. */
+ * The code grid has (height/patch_size,width/patch_size), in row-major order.
+ * With valid context, pixels, count and dimensions, null codes and zero capacity report the
+ * required count with INVALID_ARGUMENT, without reading pixels or running the model. */
 OMNI_API int omni_encode_image(omni_context *context, const float *pixels, uint32_t height,
                                uint32_t width, uint16_t *codes, size_t capacity, size_t *count);
 /* Copy the last pre-VQ features as float32 [code_count,code_dim].

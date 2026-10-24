@@ -22,6 +22,9 @@ jobs:
           python-version: '3.12'
       - name: Install test dependencies
         run: python -m pip install numpy pillow pytest httpx starlette python-multipart setuptools wheel build cmake ninja
+      - name: Exercise NumPy 1.x compatibility
+        if: runner.os == 'Linux'
+        run: python -m pip install 'numpy<2'
       - name: Configure CPU runtime
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOMNI_CUDA=OFF
       - name: Build
@@ -65,13 +68,24 @@ jobs:
           if-no-files-found: error
 
   cuda-compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+          - image: nvidia/cuda:12.8.1-devel-ubuntu24.04
     runs-on: ubuntu-24.04
-    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    container: ${{ matrix.image }}
     steps:
       - name: Install build tools
-        run: apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build g++
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ninja-build g++ python3-venv
+          python3 -m venv /tmp/omni-build-tools
+          /tmp/omni-build-tools/bin/pip install 'cmake>=3.24'
+          echo /tmp/omni-build-tools/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       - name: Compile CUDA backend without a GPU
-        run: cmake -S . -B build -G Ninja -DOMNI_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 3
+        run: cmake -S . -B build -G Ninja -DOMNI_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 3
       - name: Test C ABI error handling only
         run: ctest --test-dir build --output-on-failure

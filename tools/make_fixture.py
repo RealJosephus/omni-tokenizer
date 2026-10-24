@@ -25,7 +25,8 @@ def bf16(value):
     value = np.asarray(value, dtype=np.float32)
     bits = value.view(np.uint32)
     return (
-        (bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)
+        (bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1)))
+        & np.uint32(0xFFFF0000)
     ).view(np.float32)
 
 

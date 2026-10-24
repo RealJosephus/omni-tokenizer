@@ -19,7 +19,8 @@ Value norm(Context &c, const Value &x, const std::string &name, float eps) {
 }
 void finite_input(const float *p, size_t n) {
     for (size_t i = 0; i < n; ++i)
-        require(std::isfinite(p[i]), "Input contains a non-finite value");
+        if (!std::isfinite(p[i]))
+            throw Error(OMNI_INVALID_ARGUMENT, "Input contains a non-finite value");
 }
 void trace(Context &c, const Value &x, const std::string &name) {
     if (c.trace) {
@@ -72,16 +73,8 @@ std::vector<uint16_t> image(Context &c, const float *pixels, uint32_t height, ui
     const auto &cfg = c.model->cfg;
     c.check();
     finite_input(pixels, size_t(height) * width * 3);
-    size_t p = cfg.patch_size, gh = height / p, gw = width / p, n = gh * gw, pd = 8 * p * p;
-    std::vector<float> patches(n * pd);
-    for (size_t y = 0; y < gh; ++y)
-        for (size_t x = 0; x < gw; ++x)
-            for (size_t ch = 0; ch < 3; ++ch)
-                for (size_t dy = 0; dy < p; ++dy)
-                    for (size_t dx = 0; dx < p; ++dx)
-                        patches[(y * gw + x) * pd + (dy * p + dx) * 8 + ch] =
-                            pixels[ch * height * width + (y * p + dy) * width + x * p + dx];
-    auto x = c.ops->upload(patches.data(), n, pd, true);
+    size_t p = cfg.patch_size, gh = height / p, gw = width / p, n = gh * gw;
+    auto x = c.ops->image_patches(pixels, height, width, p);
     x = image_conv(c, x, "patch_embed.proj");
     trace(c, x, "patch");
     auto pos = c.ops->interpolate(c.model->w("pos_embed"), cfg.pos_height, gh, gw);
@@ -160,8 +153,12 @@ struct Running {
     omni::Context &c;
     explicit Running(omni::Context &ctx) : c(ctx) {
         omni::require(!c.running.test_and_set(), "Context is already executing");
+        c.ops->begin_request();
     }
-    ~Running() { c.running.clear(); }
+    ~Running() {
+        c.ops->end_request();
+        c.running.clear();
+    }
 };
 } // namespace
 extern "C" {
@@ -260,7 +257,7 @@ int omni_encode_image(omni_context *c, const float *pixels, uint32_t height, uin
         // any allocation or input read; BLAS dimensions use signed int indices.
         const uint64_t columns = std::max({uint64_t(8) * cfg.patch_size * cfg.patch_size,
                                           uint64_t(3) * cfg.width, uint64_t(cfg.ffn),
-                                          uint64_t(cfg.code_dim), uint64_t(128) * cfg.heads,
+                                          uint64_t(cfg.code_dim), uint64_t(256) * cfg.heads,
                                           uint64_t(1024)});
         const uint64_t elements = std::min(uint64_t(std::numeric_limits<int>::max()),
                                           uint64_t(std::numeric_limits<size_t>::max() / sizeof(float)));

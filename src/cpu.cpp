@@ -125,37 +125,47 @@ class Cpu final : public Ops {
         auto y = allocate(n, d, q.bf16);
         float scale = 1 / std::sqrt(float(hd));
         float split_scale = float(std::pow(double(hd), -.25));
-#pragma omp parallel for schedule(static)
-        for (int64_t task = 0; task < static_cast<int64_t>(n * heads); ++task) {
-            size_t t = static_cast<size_t>(task) / heads, h = static_cast<size_t>(task) % heads,
-                   limit = std::min(n, valid);
-            if (block)
-                limit = std::min(limit, (t / block + 1) * block);
-            std::vector<float> scores(limit);
-            float mx = -std::numeric_limits<float>::infinity();
-            for (size_t s = 0; s < limit; ++s) {
-                float z = 0;
-                for (size_t j = 0; j < hd; ++j) {
-                    float a = p(q)[t * q.cols + h * hd + j];
-                    float b = fused ? p(q)[s * q.cols + d + h * hd + j] : p(*k)[s * d + h * hd + j];
-                    z += fused ? (a * split_scale) * (b * split_scale) : (a * scale) * b;
-                }
-                scores[s] = z;
-                mx = std::max(mx, scores[s]);
-            }
-            float total = 0;
-            for (auto &z : scores) {
-                z = std::exp(z - mx);
-                total += z;
-            }
-            for (size_t j = 0; j < hd; ++j) {
-                float z = 0;
+#pragma omp parallel
+        {
+            // Each worker keeps its score storage across query rows.
+            std::vector<float> scores;
+#pragma omp for schedule(static)
+            for (int64_t task = 0; task < static_cast<int64_t>(n * heads); ++task) {
+                size_t t = static_cast<size_t>(task) / heads, h = static_cast<size_t>(task) % heads,
+                       limit = std::min(n, valid);
+                if (block)
+                    limit = std::min(limit, (t / block + 1) * block);
+                scores.resize(limit);
+                float mx = -std::numeric_limits<float>::infinity();
                 for (size_t s = 0; s < limit; ++s) {
-                    float vv =
-                        fused ? p(q)[s * q.cols + 2 * d + h * hd + j] : p(*v)[s * d + h * hd + j];
-                    z += scores[s] / total * vv;
+                    float z = 0;
+                    for (size_t j = 0; j < hd; ++j) {
+                        float a = p(q)[t * q.cols + h * hd + j];
+                        float b =
+                            fused ? p(q)[s * q.cols + d + h * hd + j] : p(*k)[s * d + h * hd + j];
+                        z += fused ? (a * split_scale) * (b * split_scale) : (a * scale) * b;
+                    }
+                    scores[s] = z;
+                    mx = std::max(mx, scores[s]);
                 }
-                p(y)[t * d + h * hd + j] = r(z, q.bf16);
+                float total = 0;
+                for (auto &z : scores) {
+                    z = std::exp(z - mx);
+                    total += z;
+                }
+                auto *output = p(y) + t * d + h * hd;
+                std::fill(output, output + hd, 0.f);
+                for (size_t s = 0; s < limit; ++s) {
+                    const float probability = scores[s] / total;
+                    const float *value =
+                        fused ? p(q) + s * q.cols + 2 * d + h * hd : p(*v) + s * d + h * hd;
+                    // Keep each output's key order while traversing contiguous values.
+                    for (size_t j = 0; j < hd; ++j)
+                        output[j] += probability * value[j];
+                }
+                if (q.bf16)
+                    for (size_t j = 0; j < hd; ++j)
+                        output[j] = r(output[j], true);
             }
         }
         return y;
@@ -218,7 +228,12 @@ class Cpu final : public Ops {
                                    std::atomic<bool> &cancel) override {
         auto xn = squares(x);
         std::vector<uint16_t> ids(x.rows);
+        std::vector<uint16_t> approximate_ids(x.bf16 ? 0 : x.rows);
+        auto &search_ids = x.bf16 ? ids : approximate_ids;
         std::vector<float> best(x.rows, std::numeric_limits<float>::infinity());
+        std::vector<double> precise_best(x.bf16 ? 0 : x.rows,
+                                         std::numeric_limits<double>::infinity());
+        const double error_factor = fp32_distance_error_factor(x.cols);
         constexpr size_t tile = 256;
         for (size_t base = 0; base < cb.rows; base += tile) {
             if (cancel.load())
@@ -228,7 +243,7 @@ class Cpu final : public Ops {
                        cb.bf16};
             auto dots = linear(x, part, nullptr);
 #pragma omp parallel for schedule(static)
-            for (int64_t i = 0; i < static_cast<int64_t>(x.rows); ++i)
+            for (int64_t i = 0; i < static_cast<int64_t>(x.rows); ++i) {
                 for (size_t j = 0; j < n; ++j) {
                     float dot = p(dots)[i * n + j];
                     float dist;
@@ -239,9 +254,34 @@ class Cpu final : public Ops {
                         dist = std::fma(-2.f, dot, p(xn)[i] + p(cbnorm)[base + j]);
                     if (dist < best[i]) {
                         best[i] = dist;
-                        ids[i] = static_cast<uint16_t>(base + j);
+                        search_ids[i] = static_cast<uint16_t>(base + j);
                     }
                 }
+                if (x.bf16)
+                    continue;
+                // Expanded L2 can lose a small distance to cancellation. Only
+                // candidates inside its error bound need a direct FP64 sum.
+                for (size_t j = 0; j < n; ++j) {
+                    const size_t code = base + j;
+                    const float distance =
+                        std::fma(-2.f, p(dots)[i * n + j], p(xn)[i] + p(cbnorm)[code]);
+                    const double tolerance =
+                        error_factor *
+                        (2 * double(p(xn)[i]) + p(cbnorm)[code] + p(cbnorm)[search_ids[i]]);
+                    if (double(distance) > double(best[i]) + tolerance)
+                        continue;
+                    double direct = 0;
+                    for (size_t k = 0; k < x.cols; ++k) {
+                        const double delta =
+                            double(p(x)[i * x.cols + k]) - p(cb)[code * x.cols + k];
+                        direct += delta * delta;
+                    }
+                    if (direct < precise_best[i] || (direct == precise_best[i] && code < ids[i])) {
+                        precise_best[i] = direct;
+                        ids[i] = static_cast<uint16_t>(code);
+                    }
+                }
+            }
         }
         return ids;
     }

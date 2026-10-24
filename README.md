@@ -12,7 +12,7 @@ developer terminal.
 python -m pip install .
 ```
 
-For CUDA, use Toolkit 12+ and an Ampere or newer GPU:
+For CUDA, use Toolkit 11.8+ and an Ampere or newer GPU:
 
 ```sh
 cmake -S . -B build-cuda -DOMNI_CUDA=ON -DCMAKE_BUILD_TYPE=Release

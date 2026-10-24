@@ -1,4 +1,5 @@
 import ctypes as C
+import json
 import os
 import shutil
 import struct
@@ -7,8 +8,8 @@ import numpy as np
 import pytest
 from omni_tokenizer.native import Library, Model, NativeError
 
-from tools.convert import HEADER
-from tools.make_fixture import generate
+from tools.convert import FIELDS, HEADER
+from tools.make_fixture import generate, write_model
 
 
 @pytest.fixture(scope="module")
@@ -60,6 +61,60 @@ def test_complete_image_graph_and_bfloat16_distance(library, models):
                 np.testing.assert_array_equal(
                     context.encode_image(expected["pixels"]), codes
                 )
+
+
+@pytest.mark.parametrize("patch_size", [8, 16])
+def test_image_output_allocation_uses_model_patch_size(
+    library, models, tmp_path, monkeypatch, patch_size
+):
+    source = models / "image"
+    manifest = json.loads((source / "manifest.json").read_text())
+    payload = (source / "model.otm").read_bytes()
+    weights = {}
+    for tensor in manifest["tensors"]:
+        bits = np.frombuffer(
+            payload, dtype="<u2", count=tensor["nbytes"] // 2, offset=tensor["offset"]
+        )
+        weights[tensor["name"]] = (
+            (bits.astype(np.uint32) << 16).view(np.float32).reshape(tensor["shape"])
+        )
+    weights["patch_embed.proj.weight"] = weights["patch_embed.proj.weight"][
+        :, :, :patch_size, :patch_size
+    ]
+    config = dict(manifest["config"], patch_size=patch_size)
+    write_model(tmp_path, "image", tuple(config[field] for field in FIELDS), weights)
+    with Model(library, tmp_path) as model, model.context() as context:
+        pixels = np.zeros((3, patch_size * 2, patch_size * 3), np.float32)
+        allocations = []
+        original = np.empty
+
+        def allocate(shape, dtype=float, *args, **kwargs):
+            if np.dtype(dtype) == np.dtype(np.uint16):
+                allocations.append(shape)
+            return original(shape, dtype, *args, **kwargs)
+
+        monkeypatch.setattr(np, "empty", allocate)
+        codes = context.encode_image(pixels)
+        assert codes.size == 6
+        assert allocations == [6]
+
+
+def test_image_capacity_query_does_not_read_input_or_execute(library, models):
+    with Model(library, models / "image") as model, model.context() as context:
+        pixel, count = C.c_float(), C.c_size_t()
+        status = library.lib.omni_encode_image(
+            context.handle, C.byref(pixel), 32, 48, None, 0, C.byref(count)
+        )
+        assert status == 1 and count.value == 6
+        assert context.peak_workspace_bytes == 0
+        with pytest.raises(NativeError, match="No completed feature"):
+            context.features(6)
+        context.cancel()
+        with pytest.raises(NativeError) as failure:
+            context.encode_image(np.zeros((3, 32, 48), np.float32))
+        assert failure.value.status == 6
+        library.lib.omni_context_reset_cancel(context.handle)
+        assert context.encode_image(np.zeros((3, 32, 48), np.float32)).size == 6
 
 
 def test_unicode_model_path(library, models, tmp_path):
@@ -189,3 +244,32 @@ def test_missing_model_has_io_error(library, tmp_path):
     with pytest.raises(NativeError) as failure:
         Model(library, tmp_path / "missing.otm")
     assert failure.value.status == 2
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_nonfinite_image_input_rejected_before_inference(
+    library, models, invalid_value
+):
+    with (
+        np.load(models / "image" / "expected.npz") as expected,
+        Model(library, models / "image") as model,
+        model.context() as context,
+    ):
+        pixels = expected["pixels"].copy()
+        pixels.flat[-1] = invalid_value
+        codes = np.empty(expected["codes"].size, dtype=np.uint16)
+        count = C.c_size_t()
+        status = library.lib.omni_encode_image(
+            context.handle,
+            pixels.ctypes.data_as(C.POINTER(C.c_float)),
+            pixels.shape[1],
+            pixels.shape[2],
+            codes.ctypes.data_as(C.POINTER(C.c_uint16)),
+            codes.size,
+            C.byref(count),
+        )
+        assert status == 1
+        assert b"non-finite" in library.lib.omni_last_error()
+        np.testing.assert_array_equal(
+            context.encode_image(expected["pixels"]), expected["codes"]
+        )

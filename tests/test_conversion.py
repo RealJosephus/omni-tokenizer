@@ -4,8 +4,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from tools.convert import HEADER, check_package, inspect_model
-from tools.make_fixture import generate
+from tools.make_fixture import bf16, generate
+
+
+class BFloat16FixtureTests(unittest.TestCase):
+    def test_scalar_and_array_rounding_preserve_float32_and_ties_to_even(self):
+        values = np.array([0, 1.00390625, 1.01171875, -1.00390625], np.float32)
+        expected = np.array([0, 1, 1.015625, -1], np.float32)
+        rounded = bf16(values)
+        self.assertEqual(rounded.dtype, np.dtype(np.float32))
+        np.testing.assert_array_equal(rounded, expected)
+        for value, wanted in zip(values, expected):
+            scalar = bf16(value)
+            self.assertEqual(scalar.shape, ())
+            self.assertEqual(scalar.dtype, np.dtype(np.float32))
+            self.assertEqual(scalar, wanted)
 
 
 class ModelPackageTests(unittest.TestCase):

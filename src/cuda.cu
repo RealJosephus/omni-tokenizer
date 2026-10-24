@@ -1,4 +1,7 @@
 #include "internal.h"
+#include "flash_attention.h"
+#include "audio_attention.h"
+#include "audio_linear.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cuda_bf16.h>
@@ -63,6 +66,22 @@ __global__ void convert_kernel(const float *x, void *y, size_t n, bool b) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n)
         put(y, i, x[i], b);
+}
+__global__ void image_patches_kernel(const float *pixels, void *patches, size_t height,
+                                     size_t width, size_t patch, size_t count) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+    const size_t channel = i % 8;
+    float value = 0;
+    if (channel < 3) {
+        const size_t pixel = i / 8, patch_area = patch * patch, gw = width / patch;
+        const size_t tile = pixel / patch_area, inside = pixel % patch_area;
+        const size_t y = tile / gw * patch + inside / patch;
+        const size_t x = tile % gw * patch + inside % patch;
+        value = pixels[channel * height * width + y * width + x];
+    }
+    put(patches, i, value, true);
 }
 __global__ void download_kernel(const void *x, float *y, size_t n, bool b) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -290,11 +309,14 @@ __global__ void softmax_large_kernel(float *s, size_t n) {
         mx = fmaxf(mx, s[row * n + j]);
     mx = reduce_warps<true>(mx, shared);
     float sum = 0;
-    for (size_t j = threadIdx.x; j < n; j += 1024)
-        sum += expf(s[row * n + j] - mx);
+    for (size_t j = threadIdx.x; j < n; j += 1024) {
+        float z = expf(s[row * n + j] - mx);
+        s[row * n + j] = z;
+        sum += z;
+    }
     sum = reduce_warps<false>(sum, shared);
     for (size_t j = threadIdx.x; j < n; j += 1024)
-        s[row * n + j] = expf(s[row * n + j] - mx) / sum;
+        s[row * n + j] /= sum;
 }
 __global__ void unpack_kernel(const float *x, void *y, size_t n, size_t d, size_t heads,
                               size_t tile, size_t base, bool bf) {
@@ -312,59 +334,212 @@ __global__ void best_init(float *best, uint16_t *ids, size_t n) {
     }
 }
 __global__ void argmin_kernel(const void *dots, const void *xn, const void *cn, float *best,
-                              uint16_t *ids, size_t m, size_t tile, size_t base, bool bf) {
-    size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (row >= m)
-        return;
+                              uint16_t *ids, size_t tile, size_t base, bool bf) {
+    const size_t row = blockIdx.x;
+    const float x = get(xn, row, bf);
     float score = best[row];
-    uint16_t id = ids[row];
-    for (size_t j = 0; j < tile; ++j) {
-        float dot = get(dots, row * tile + j, bf), x = get(xn, row, bf), c = get(cn, base + j, bf);
+    unsigned id = ids[row];
+    // Each lane scans interleaved codes; equal distances retain the smallest code ID.
+    for (size_t j = threadIdx.x; j < tile; j += blockDim.x) {
+        float dot = get(dots, row * tile + j, bf), c = get(cn, base + j, bf);
         float dist = bf ? rnd(rnd(x + c, true) - rnd(2 * dot, true), true) : fmaf(-2.f, dot, x + c);
-        if (dist < score) {
+        unsigned candidate = unsigned(base + j);
+        if (dist < score || (dist == score && candidate < id)) {
             score = dist;
-            id = uint16_t(base + j);
+            id = candidate;
         }
     }
-    best[row] = score;
-    ids[row] = id;
+    for (int offset = 16; offset; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, score, offset);
+        unsigned other_id = __shfl_down_sync(0xffffffff, id, offset);
+        if (other < score || (other == score && other_id < id)) {
+            score = other;
+            id = other_id;
+        }
+    }
+    __shared__ float scores[8];
+    __shared__ unsigned indices[8];
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (!lane) {
+        scores[warp] = score;
+        indices[warp] = id;
+    }
+    __syncthreads();
+    if (!warp) {
+        score = lane < 8 ? scores[lane] : CUDART_INF_F;
+        id = lane < 8 ? indices[lane] : UINT32_MAX;
+        for (int offset = 16; offset; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffff, score, offset);
+            unsigned other_id = __shfl_down_sync(0xffffffff, id, offset);
+            if (other < score || (other == score && other_id < id)) {
+                score = other;
+                id = other_id;
+            }
+        }
+        if (!lane) {
+            best[row] = score;
+            ids[row] = uint16_t(id);
+        }
+    }
+}
+
+__global__ void refine_fp32_vq_kernel(const float *x, const float *cb, const float *dots,
+                                      const float *xn, const float *cn,
+                                      const float *approximate_best,
+                                      const uint16_t *approximate_ids, double *best, uint16_t *ids,
+                                      size_t width, size_t tile, size_t base, double error_factor) {
+    const size_t row = blockIdx.x;
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    double score = base ? best[row] : CUDART_INF;
+    unsigned id = base ? ids[row] : 0;
+    __shared__ unsigned candidates[1024], count;
+    if (!threadIdx.x)
+        count = 0;
+    __syncthreads();
+    for (size_t j = threadIdx.x; j < tile; j += blockDim.x) {
+        const size_t code = base + j;
+        const float distance = fmaf(-2.f, dots[row * tile + j], xn[row] + cn[code]);
+        const double tolerance =
+            error_factor * (2 * double(xn[row]) + cn[code] + cn[approximate_ids[row]]);
+        // NaN/overflow in the approximate expression must not discard a code.
+        if (!(double(distance) > double(approximate_best[row]) + tolerance))
+            candidates[atomicAdd(&count, 1U)] = unsigned(code);
+    }
+    __syncthreads();
+    for (size_t candidate = warp; candidate < count; candidate += 8) {
+        const size_t code = candidates[candidate];
+        double distance = 0;
+        for (size_t k = lane; k < width; k += 32) {
+            const double delta = double(x[row * width + k]) - cb[code * width + k];
+            distance += delta * delta;
+        }
+        for (int step = 16; step; step >>= 1)
+            distance += __shfl_down_sync(0xffffffff, distance, step);
+        if (!lane && (distance < score || (distance == score && code < id))) {
+            score = distance;
+            id = unsigned(code);
+        }
+    }
+    __shared__ double scores[8];
+    __shared__ unsigned indices[8];
+    if (!lane) {
+        scores[warp] = score;
+        indices[warp] = id;
+    }
+    __syncthreads();
+    if (!warp) {
+        score = lane < 8 ? scores[lane] : CUDART_INF;
+        id = lane < 8 ? indices[lane] : UINT32_MAX;
+        for (int step = 16; step; step >>= 1) {
+            const double other = __shfl_down_sync(0xffffffff, score, step);
+            const unsigned other_id = __shfl_down_sync(0xffffffff, id, step);
+            if (other < score || (other == score && other_id < id)) {
+                score = other;
+                id = other_id;
+            }
+        }
+        if (!lane) {
+            best[row] = score;
+            ids[row] = uint16_t(id);
+        }
+    }
 }
 
 struct Pool {
     int device;
     std::shared_ptr<Memory> memory;
-    std::multimap<size_t, void *> free;
-    size_t cached = 0;
+    struct Cached {
+        void *pointer;
+        uint64_t released;
+    };
+    std::multimap<size_t, Cached> free;
+    size_t cached = 0, active = 0, peak_active = 0, largest_request = 0;
+    uint64_t release_clock = 0;
+    bool in_request = false;
     std::mutex mutex;
     static constexpr size_t limit = 128 * 1024 * 1024;
     Pool(int d, std::shared_ptr<Memory> m) : device(d), memory(std::move(m)) {}
     ~Pool() {
         cudaSetDevice(device);
         for (auto &p : free) {
-            cudaFree(p.second);
+            cudaFree(p.second.pointer);
             memory->live.fetch_sub(p.first);
         }
+    }
+    void trim(size_t bytes) noexcept {
+        while (cached > bytes) {
+            auto oldest =
+                std::min_element(free.begin(), free.end(), [](const auto &a, const auto &b) {
+                    return a.second.released < b.second.released;
+                });
+            cudaSetDevice(device);
+            cudaFree(oldest->second.pointer);
+            memory->live.fetch_sub(oldest->first);
+            cached -= oldest->first;
+            free.erase(oldest);
+        }
+    }
+    void begin_request() noexcept {
+        std::lock_guard<std::mutex> guard(mutex);
+        peak_active = active;
+        largest_request = 0;
+        in_request = true;
+    }
+    void end_request() noexcept {
+        std::lock_guard<std::mutex> guard(mutex);
+        in_request = false;
+        trim(limit);
     }
     std::pair<void *, size_t> acquire(size_t bytes) {
         std::lock_guard<std::mutex> guard(mutex);
         auto it = free.lower_bound(bytes);
-        if (it != free.end() && it->first <= bytes + bytes / 4) {
-            auto result = std::make_pair(it->second, it->first);
+        largest_request = std::max(largest_request, bytes);
+        if (it != free.end() && it->first <= bytes + bytes / 2) {
+            auto result = std::make_pair(it->second.pointer, it->first);
             cached -= it->first;
+            active += it->first;
+            peak_active = std::max(peak_active, active);
             free.erase(it);
             return result;
         }
+        const size_t next_active = active + bytes;
+        const size_t next_peak = std::max(peak_active, next_active);
+        if (in_request) {
+            // One largest-request reserve lets differently shaped temporaries rotate.
+            // Cached bytes never feed the high-water mark, and request exit trims them.
+            const size_t budget = std::max(limit, next_peak + largest_request);
+            trim(budget - next_active);
+        }
         void *p = nullptr;
-        check_cuda(cudaMalloc(&p, bytes));
+        auto status = cudaMalloc(&p, bytes);
+        if (status == cudaErrorMemoryAllocation) {
+            if (cudaPeekAtLastError() == cudaErrorMemoryAllocation)
+                cudaGetLastError();
+            if (cached) {
+                // Cached storage is optional. Reclaim it before reporting memory pressure.
+                trim(0);
+                p = nullptr;
+                status = cudaMalloc(&p, bytes);
+                if (status == cudaErrorMemoryAllocation &&
+                    cudaPeekAtLastError() == cudaErrorMemoryAllocation)
+                    cudaGetLastError();
+            }
+        }
+        check_cuda(status);
         memory->add(bytes);
+        active = next_active;
+        peak_active = next_peak;
         return {p, bytes};
     }
     void release(void *p, size_t bytes) noexcept {
         std::lock_guard<std::mutex> guard(mutex);
-        if (cached + bytes <= limit) {
+        active -= bytes;
+        if (in_request || bytes <= limit) {
             try {
-                free.emplace(bytes, p);
+                free.emplace(bytes, Cached{p, ++release_clock});
                 cached += bytes;
+                if (!in_request)
+                    trim(limit);
                 return;
             } catch (...) {
             }
@@ -376,19 +551,50 @@ struct Pool {
 };
 
 class Cuda final : public Ops {
+    size_t fa2_length_ = 0;
+    int fa2_splits_ = 1;
     int device_;
     cudaStream_t stream_ = nullptr;
     cublasHandle_t blas_ = nullptr;
     cublasLtHandle_t lt_ = nullptr;
+    cublasLtMatmulPreference_t preference_ = nullptr;
+    cublasLtMatmulPreference_t biased_preference_ = nullptr;
     void *workspace_ = nullptr;
     static constexpr size_t workspace_bytes = 32 * 1024 * 1024;
     using Key = std::tuple<size_t, size_t, size_t, bool, bool>;
-    std::map<Key, cublasLtMatmulAlgo_t> algorithms_;
+    struct MatmulPlan {
+        cublasLtMatmulDesc_t op = nullptr;
+        cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+        cublasLtMatmulAlgo_t algorithm{};
+        uint64_t last_use = 0;
+        ~MatmulPlan() {
+            if (c)
+                cublasLtMatrixLayoutDestroy(c);
+            if (b)
+                cublasLtMatrixLayoutDestroy(b);
+            if (a)
+                cublasLtMatrixLayoutDestroy(a);
+            if (op)
+                cublasLtMatmulDescDestroy(op);
+        }
+    };
+    static constexpr size_t max_plans = 64;
+    std::map<Key, std::unique_ptr<MatmulPlan>> plans_;
+    uint64_t plan_clock_ = 0;
     std::shared_ptr<Pool> pool_;
     void cleanup() noexcept {
         cudaSetDevice(device_);
         if (stream_)
             cudaStreamSynchronize(stream_);
+        plans_.clear();
+        if (biased_preference_) {
+            cublasLtMatmulPreferenceDestroy(biased_preference_);
+            biased_preference_ = nullptr;
+        }
+        if (preference_) {
+            cublasLtMatmulPreferenceDestroy(preference_);
+            preference_ = nullptr;
+        }
         if (workspace_) {
             cudaFree(workspace_);
             workspace_ = nullptr;
@@ -433,6 +639,59 @@ class Cuda final : public Ops {
     static unsigned blocks(size_t n) { return static_cast<unsigned>((n + 255) / 256); }
     void launch_check() { check_cuda(cudaGetLastError()); }
 
+    MatmulPlan &matmul_plan(const Value &x, const Value &w, const Value *bias) {
+        const Key key{x.rows, w.rows, x.cols, x.bf16, bias != nullptr};
+        auto found = plans_.find(key);
+        if (found == plans_.end()) {
+            auto plan = std::make_unique<MatmulPlan>();
+            const auto type = x.bf16 ? CUDA_R_16BF : CUDA_R_32F;
+            const auto compute = x.bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC;
+            check_blas(cublasLtMatmulDescCreate(&plan->op, compute, CUDA_R_32F));
+            cublasOperation_t trans = CUBLAS_OP_T;
+            check_blas(cublasLtMatmulDescSetAttribute(plan->op, CUBLASLT_MATMUL_DESC_TRANSA, &trans,
+                                                      sizeof(trans)));
+            if (bias) {
+                auto epilogue = CUBLASLT_EPILOGUE_BIAS;
+                const void *ptr = bias->data();
+                check_blas(cublasLtMatmulDescSetAttribute(plan->op, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                                          &epilogue, sizeof(epilogue)));
+                check_blas(cublasLtMatmulDescSetAttribute(
+                    plan->op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &ptr, sizeof(ptr)));
+            }
+            check_blas(cublasLtMatrixLayoutCreate(&plan->a, type, w.cols, w.rows, int64_t(w.cols)));
+            check_blas(cublasLtMatrixLayoutCreate(&plan->b, type, x.cols, x.rows, int64_t(x.cols)));
+            check_blas(cublasLtMatrixLayoutCreate(&plan->c, type, w.rows, x.rows, int64_t(w.rows)));
+            cublasLtMatmulHeuristicResult_t heuristic{};
+            int returned = 0;
+            // Large FP32 biased linears benefit from the same bounded heuristic
+            // workspace as BF16. Keep short audio linears on the wider search.
+            const auto preference =
+                bias && (x.bf16 || x.rows >= 512) ? biased_preference_ : preference_;
+            check_blas(cublasLtMatmulAlgoGetHeuristic(lt_, plan->op, plan->a, plan->b, plan->c,
+                                                      plan->c, preference, 1, &heuristic,
+                                                      &returned));
+            require(returned > 0, "cuBLASLt has no compatible algorithm", OMNI_UNSUPPORTED);
+            plan->algorithm = heuristic.algo;
+            if (plans_.size() == max_plans) {
+                auto oldest = std::min_element(plans_.begin(), plans_.end(),
+                                               [](const auto &a, const auto &b) {
+                                                   return a.second->last_use < b.second->last_use;
+                                               });
+                plans_.erase(oldest);
+            }
+            found = plans_.emplace(key, std::move(plan)).first;
+        }
+        auto &plan = *found->second;
+        plan.last_use = ++plan_clock_;
+        // A shape is shared by different layers; never retain the previous layer's bias.
+        if (bias) {
+            const void *ptr = bias->data();
+            check_blas(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                                      &ptr, sizeof(ptr)));
+        }
+        return plan;
+    }
+
   public:
     explicit Cuda(int device) : device_(device) {
         try {
@@ -442,6 +701,20 @@ class Cuda final : public Ops {
             check_blas(cublasSetStream(blas_, stream_));
             check_blas(cublasSetMathMode(blas_, CUBLAS_PEDANTIC_MATH));
             check_blas(cublasLtCreate(&lt_));
+            check_blas(cublasLtMatmulPreferenceCreate(&preference_));
+            check_blas(cublasLtMatmulPreferenceCreate(&biased_preference_));
+            // Match the original BF16 biased linear path, including its reduction choices.
+            size_t biased_ws = 1024 * 1024;
+            check_blas(cublasLtMatmulPreferenceSetAttribute(
+                biased_preference_, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &biased_ws,
+                sizeof(biased_ws)));
+            size_t ws = workspace_bytes;
+            check_blas(cublasLtMatmulPreferenceSetAttribute(
+                preference_, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+            uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+            check_blas(cublasLtMatmulPreferenceSetAttribute(
+                preference_, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction,
+                sizeof(reduction)));
             check_cuda(cudaMalloc(&workspace_, workspace_bytes));
             memory->add(workspace_bytes);
         } catch (...) {
@@ -450,6 +723,14 @@ class Cuda final : public Ops {
         }
     }
     void enable_reuse() override { pool_ = std::make_shared<Pool>(device_, memory); }
+    void begin_request() noexcept override {
+        if (pool_)
+            pool_->begin_request();
+    }
+    void end_request() noexcept override {
+        if (pool_)
+            pool_->end_request();
+    }
     ~Cuda() override { cleanup(); }
     Value raw_upload(const void *x, size_t rows, size_t cols, bool b) override {
         auto y = allocate(rows, cols, b);
@@ -467,6 +748,15 @@ class Cuda final : public Ops {
                                                               y.data(), y.size(), b);
         launch_check();
         return y;
+    }
+    Value image_patches(const float *pixels, size_t height, size_t width, size_t patch) override {
+        auto input = raw_upload(pixels, 3, height * width, false);
+        auto output = allocate((height / patch) * (width / patch), 8 * patch * patch, true);
+        image_patches_kernel<<<blocks(output.size()), 256, 0, stream_>>>(
+            static_cast<const float *>(input.data()), output.data(), height, width, patch,
+            output.size());
+        launch_check();
+        return output;
     }
     std::vector<float> download(const Value &x) override {
         check_cuda(cudaSetDevice(device_));
@@ -489,68 +779,19 @@ class Cuda final : public Ops {
     Value linear(const Value &x, const Value &w, const Value *b) override {
         require(x.cols == w.cols && x.bf16 == w.bf16, "CUDA linear shape/dtype mismatch",
                 OMNI_INVALID_MODEL);
+        require(!b || b->bf16 == x.bf16, "CUDA bias dtype mismatch", OMNI_INVALID_MODEL);
         auto y = allocate(x.rows, w.rows, x.bf16);
-        cublasLtMatmulDesc_t op = nullptr;
-        cublasLtMatrixLayout_t a = nullptr, bb = nullptr, cc = nullptr;
-        cublasLtMatmulPreference_t pref = nullptr;
-        struct Cleanup {
-            cublasLtMatmulDesc_t *op;
-            cublasLtMatrixLayout_t *a, *b, *c;
-            cublasLtMatmulPreference_t *p;
-            ~Cleanup() {
-                if (*p)
-                    cublasLtMatmulPreferenceDestroy(*p);
-                if (*c)
-                    cublasLtMatrixLayoutDestroy(*c);
-                if (*b)
-                    cublasLtMatrixLayoutDestroy(*b);
-                if (*a)
-                    cublasLtMatrixLayoutDestroy(*a);
-                if (*op)
-                    cublasLtMatmulDescDestroy(*op);
-            }
-        } cleanup{&op, &a, &bb, &cc, &pref};
-        auto type = x.bf16 ? CUDA_R_16BF : CUDA_R_32F;
-        auto compute = x.bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC;
-        check_blas(cublasLtMatmulDescCreate(&op, compute, CUDA_R_32F));
-        cublasOperation_t trans = CUBLAS_OP_T;
-        check_blas(
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
-        if (b) {
-            require(b->bf16 == x.bf16, "CUDA bias dtype mismatch", OMNI_INVALID_MODEL);
-            auto epi = CUBLASLT_EPILOGUE_BIAS;
-            const void *ptr = b->data();
-            check_blas(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi,
-                                                      sizeof(epi)));
-            check_blas(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &ptr,
-                                                      sizeof(ptr)));
-        }
-        check_blas(cublasLtMatrixLayoutCreate(&a, type, w.cols, w.rows, int64_t(w.cols)));
-        check_blas(cublasLtMatrixLayoutCreate(&bb, type, x.cols, x.rows, int64_t(x.cols)));
-        check_blas(cublasLtMatrixLayoutCreate(&cc, type, w.rows, x.rows, int64_t(w.rows)));
-        Key key{x.rows, w.rows, x.cols, x.bf16, b != nullptr};
-        auto found = algorithms_.find(key);
-        cublasLtMatmulAlgo_t algo;
-        if (found == algorithms_.end()) {
-            check_blas(cublasLtMatmulPreferenceCreate(&pref));
-            size_t ws = workspace_bytes;
-            check_blas(cublasLtMatmulPreferenceSetAttribute(
-                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
-            uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
-            check_blas(cublasLtMatmulPreferenceSetAttribute(
-                pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction, sizeof(reduction)));
-            cublasLtMatmulHeuristicResult_t heuristic{};
-            int returned = 0;
-            check_blas(cublasLtMatmulAlgoGetHeuristic(lt_, op, a, bb, cc, cc, pref, 1, &heuristic,
-                                                      &returned));
-            require(returned > 0, "cuBLASLt has no compatible algorithm", OMNI_UNSUPPORTED);
-            algo = heuristic.algo;
-            algorithms_.emplace(key, algo);
-        } else
-            algo = found->second;
+        if (!x.bf16 && b && x.rows >= 256 &&
+            audio_linear(static_cast<const float *>(x.data()),
+                         static_cast<const float *>(w.data()),
+                         static_cast<const float *>(b->data()), static_cast<float *>(y.data()),
+                         x.rows, w.rows, x.cols, stream_))
+            return y;
+        auto &plan = matmul_plan(x, w, b);
         float alpha = 1, beta = 0;
-        check_blas(cublasLtMatmul(lt_, op, &alpha, w.data(), a, x.data(), bb, &beta, y.data(), cc,
-                                  y.data(), cc, &algo, workspace_, workspace_bytes, stream_));
+        check_blas(cublasLtMatmul(lt_, plan.op, &alpha, w.data(), plan.a, x.data(), plan.b, &beta,
+                                  y.data(), plan.c, y.data(), plan.c, &plan.algorithm, workspace_,
+                                  workspace_bytes, stream_));
         return y;
     }
     Value norm(const Value &x, const Value &w, const Value &b, float eps) override {
@@ -592,24 +833,55 @@ class Cuda final : public Ops {
                     size_t valid, bool fused) override {
         const size_t n = q.rows, d = fused ? q.cols / 3 : q.cols, hd = d / heads;
         auto y = allocate(n, d, q.bf16);
+        if (!fused && !q.bf16 && hd == 64) {
+            audio_attention(static_cast<const float *>(q.data()),
+                            static_cast<const float *>(k->data()),
+                            static_cast<const float *>(v->data()), static_cast<float *>(y.data()),
+                            n, heads, block, valid, stream_);
+            return y;
+        }
+        if (fused && q.bf16 && heads == 16 && hd == 96) {
+            if (fa2_length_ != n) {
+                fa2_splits_ = flash_attention_splits(n);
+                fa2_length_ = n;
+            }
+            auto lse = allocate(heads, n, false);
+            Value accum;
+            if (fa2_splits_ > 1)
+                accum = allocate(size_t(fa2_splits_) * heads, n * (hd + 1), false);
+            flash_attention(q.data(), y.data(), static_cast<float *>(lse.data()),
+                            fa2_splits_ > 1 ? static_cast<float *>(accum.data()) : nullptr, n,
+                            fa2_splits_, stream_);
+            return y;
+        }
+
+        // Larger FP32 audio tiles give the small per-head GEMMs enough parallel
+        // work, while keeping score storage bounded independently of length.
+        const size_t max_tile = fused ? (n >= 256 ? 256 : 128) : 512;
         auto qp = allocate(n, d, false), kp = allocate(n, d, false), vp = allocate(n, d, false);
+        auto scores = allocate(heads * std::min(max_tile, n), n, false),
+             output = allocate(heads * std::min(max_tile, n), hd, false);
         pack_kernel<<<blocks(n * d), 256, 0, stream_>>>(
             q.data(), k ? k->data() : nullptr, v ? v->data() : nullptr,
             static_cast<float *>(qp.data()), static_cast<float *>(kp.data()),
             static_cast<float *>(vp.data()), n, d, heads, q.bf16, fused,
             fused ? float(std::pow(double(hd), -.25)) : 1 / std::sqrt(float(hd)));
         launch_check();
-        constexpr size_t max_tile = 128;
-        for (size_t base = 0; base < n; base += max_tile) {
+        for (size_t base = 0; base < n;) {
             size_t tile = std::min(max_tile, n - base);
-            auto scores = allocate(heads * tile, n, false),
-                 output = allocate(heads * tile, hd, false);
+            // Preserve the original GEMM shape for a partial final tile.
+            if (fused && tile > 128 && tile < 256)
+                tile = 128;
+            // Omit only future blocks shared by every query in this tile.
+            // Keep valid-key padding and padded queries in the numerical path.
+            const size_t keys =
+                !fused && block ? std::min(n, ((base + tile - 1) / block + 1) * block) : n;
             float alpha = 1, beta = 0;
             check_blas(cublasSgemmStridedBatched(
-                blas_, CUBLAS_OP_T, CUBLAS_OP_N, int(n), int(tile), int(hd), &alpha,
+                blas_, CUBLAS_OP_T, CUBLAS_OP_N, int(keys), int(tile), int(hd), &alpha,
                 static_cast<float *>(kp.data()), int(hd), n * hd,
                 static_cast<float *>(qp.data()) + base * hd, int(hd), n * hd, &beta,
-                static_cast<float *>(scores.data()), int(n), tile * n, int(heads)));
+                static_cast<float *>(scores.data()), int(keys), tile * keys, int(heads)));
             if (fused && n >= 32 && n <= 2048)
                 softmax_warp_kernel<<<unsigned((heads * tile + 3) / 4), 128, 0, stream_>>>(
                     static_cast<float *>(scores.data()), n, heads * tile);
@@ -618,17 +890,18 @@ class Cuda final : public Ops {
                     static_cast<float *>(scores.data()), n);
             else
                 softmax_kernel<<<unsigned(heads * tile), 256, 0, stream_>>>(
-                    static_cast<float *>(scores.data()), n, tile, base, block, valid);
+                    static_cast<float *>(scores.data()), keys, tile, base, block, valid);
             launch_check();
             alpha = 1;
             check_blas(cublasSgemmStridedBatched(
-                blas_, CUBLAS_OP_N, CUBLAS_OP_N, int(hd), int(tile), int(n), &alpha,
+                blas_, CUBLAS_OP_N, CUBLAS_OP_N, int(hd), int(tile), int(keys), &alpha,
                 static_cast<float *>(vp.data()), int(hd), n * hd,
-                static_cast<float *>(scores.data()), int(n), tile * n, &beta,
+                static_cast<float *>(scores.data()), int(keys), tile * keys, &beta,
                 static_cast<float *>(output.data()), int(hd), tile * hd, int(heads)));
             unpack_kernel<<<blocks(tile * d), 256, 0, stream_>>>(
                 static_cast<float *>(output.data()), y.data(), n, d, heads, tile, base, q.bf16);
             launch_check();
+            base += tile;
         }
         return y;
     }
@@ -661,6 +934,12 @@ class Cuda final : public Ops {
     std::vector<uint16_t> quantize(const Value &x, const Value &cb, const Value &cn,
                                    std::atomic<bool> &cancel) override {
         auto xn = squares(x), best = allocate(x.rows, 1, false), ids = allocate(x.rows, 1, true);
+        Value precise_best, precise_ids;
+        if (!x.bf16) {
+            precise_best = allocate(x.rows, 2, false); // One FP64 distance per query.
+            precise_ids = allocate(x.rows, 1, true);
+        }
+        const double error_factor = fp32_distance_error_factor(x.cols);
         best_init<<<blocks(x.rows), 256, 0, stream_>>>(static_cast<float *>(best.data()),
                                                        static_cast<uint16_t *>(ids.data()), x.rows);
         launch_check();
@@ -671,14 +950,24 @@ class Cuda final : public Ops {
             char *ptr = static_cast<char *>(cb.data()) + base * cb.cols * (cb.bf16 ? 2 : 4);
             Value part{std::shared_ptr<void>(cb.storage, ptr), tile, cb.cols, cb.bf16};
             auto dots = linear(x, part, nullptr);
-            argmin_kernel<<<blocks(x.rows), 256, 0, stream_>>>(
+            argmin_kernel<<<unsigned(x.rows), 256, 0, stream_>>>(
                 dots.data(), xn.data(), cn.data(), static_cast<float *>(best.data()),
-                static_cast<uint16_t *>(ids.data()), x.rows, tile, base, x.bf16);
+                static_cast<uint16_t *>(ids.data()), tile, base, x.bf16);
             launch_check();
+            if (!x.bf16) {
+                refine_fp32_vq_kernel<<<unsigned(x.rows), 256, 0, stream_>>>(
+                    static_cast<const float *>(x.data()), static_cast<const float *>(cb.data()),
+                    static_cast<const float *>(dots.data()), static_cast<const float *>(xn.data()),
+                    static_cast<const float *>(cn.data()), static_cast<const float *>(best.data()),
+                    static_cast<const uint16_t *>(ids.data()),
+                    static_cast<double *>(precise_best.data()),
+                    static_cast<uint16_t *>(precise_ids.data()), x.cols, tile, base, error_factor);
+                launch_check();
+            }
         }
         std::vector<uint16_t> out(x.rows);
-        check_cuda(cudaMemcpyAsync(out.data(), ids.data(), out.size() * 2, cudaMemcpyDeviceToHost,
-                                   stream_));
+        check_cuda(cudaMemcpyAsync(out.data(), x.bf16 ? ids.data() : precise_ids.data(),
+                                   out.size() * 2, cudaMemcpyDeviceToHost, stream_));
         synchronize();
         return out;
     }

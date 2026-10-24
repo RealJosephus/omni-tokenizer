@@ -1,9 +1,9 @@
 include CMakeLists.txt
 include CMakePresets.json
-recursive-include cmake *.cmake.in
+recursive-include cmake *.cmake.in *.cmake
 recursive-include include *.h
-recursive-include src *.h *.cpp *.cu
-recursive-include tests *.cpp
+recursive-include src *.h *.cpp *.cu *.cuh
+recursive-include tests *.cpp *.h
 recursive-include tests *.mjs
 recursive-include tests CMakeLists.txt
 recursive-include tools *.py

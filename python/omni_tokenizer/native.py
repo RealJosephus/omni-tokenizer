@@ -224,8 +224,27 @@ class Context:
             or not all(0 < x <= 0xFFFFFFFF for x in pixels.shape[1:])
         ):
             raise ValueError("Expected RGB CHW pixels with positive uint32 dimensions")
+        if not self.handle:
+            raise RuntimeError("Context is closed")
         h, w = pixels.shape[1:]
-        return self._encode(self.library.lib.omni_encode_image, pixels, h, w, h * w)
+        count = C.c_size_t()
+        # The capacity check reports the model's patch count before reading pixels
+        # or executing inference. This also works with older native libraries.
+        status = self.library.lib.omni_encode_image(
+            self.handle,
+            pixels.ctypes.data_as(C.POINTER(C.c_float)),
+            h,
+            w,
+            None,
+            0,
+            C.byref(count),
+        )
+        if status != 1 or count.value == 0:
+            self.library.check(status)
+            raise RuntimeError("Native image capacity query returned no code count")
+        return self._encode(
+            self.library.lib.omni_encode_image, pixels, h, w, count.value
+        )
 
     def _encode(self, fn, data, dim1, dim2, capacity):
         if not self.handle:

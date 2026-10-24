@@ -3,12 +3,19 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace omni {
+// A conservative gamma bound for FP32 squared norms, dot products and the
+// comparison of two expanded L2 distances. Overflow falls back to refinement.
+inline double fp32_distance_error_factor(size_t dimension) {
+    const double e = (double(dimension) + 4) * std::numeric_limits<float>::epsilon();
+    return e < 1 ? 2 * e / (1 - e) : std::numeric_limits<double>::infinity();
+}
 struct Error : std::runtime_error {
     int code;
     Error(int c, const std::string &s) : std::runtime_error(s), code(c) {}
@@ -47,7 +54,22 @@ class Ops {
     std::shared_ptr<Memory> memory = std::make_shared<Memory>();
     virtual ~Ops() = default;
     virtual void enable_reuse() {}
+    virtual void begin_request() noexcept {}
+    virtual void end_request() noexcept {}
     virtual Value upload(const float *, size_t, size_t, bool) = 0;
+    virtual Value image_patches(const float *pixels, size_t height, size_t width, size_t patch) {
+        const size_t gh = height / patch, gw = width / patch, pd = 8 * patch * patch;
+        std::vector<float> patches(gh * gw * pd);
+        for (size_t y = 0; y < gh; ++y)
+            for (size_t x = 0; x < gw; ++x)
+                for (size_t ch = 0; ch < 3; ++ch)
+                    for (size_t dy = 0; dy < patch; ++dy)
+                        for (size_t dx = 0; dx < patch; ++dx)
+                            patches[(y * gw + x) * pd + (dy * patch + dx) * 8 + ch] =
+                                pixels[ch * height * width + (y * patch + dy) * width + x * patch +
+                                       dx];
+        return upload(patches.data(), gh * gw, pd, true);
+    }
     virtual Value raw_upload(const void *, size_t, size_t, bool) = 0;
     virtual std::vector<float> download(const Value &) = 0;
     virtual Value linear(const Value &, const Value &, const Value *) = 0;
